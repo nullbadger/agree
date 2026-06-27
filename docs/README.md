@@ -10,11 +10,6 @@
 `agree` is **unstable**.\
 Version semantics: `^([0-9]+\.[0-9]+\.[0-9]+)(-(alpha|beta)\.[0-9]+)?$`.
 
-### Backwards compatibility
-
-Withing one major version (starting from the first stable release v1.0), there will be full backwards compatibility according to the semantic versioning standard. Note that in order to keep flexibility for development, newer major versions might not be able to work with old format / version archives. Use and install the according version in order to use those. Archives revisions (and their associated program version) can be inspected using the `info` command, assuming you use a version that is the same or newer than the one that was used to create the archive.\
-__Note__: Prior to the first major version release (v1), backwards compatibility will only be guaranteed in the same minor version.
-
 ## Example
 
 ### Split a secret into _n_ shares (interactive)
@@ -41,26 +36,29 @@ Note that if any password is encrypted and the `-i` flag is **not** provided, th
 
 ### Split a secret into _n_ shares (via blueprint)
 
-The example below will split the secret into three shares with a restore threshold of two. Assuming the file is called `blueprint.yaml`, we can use the following command:
+The example below will split the secret into three shares with a restore threshold of two. Assuming the file is called `blueprint.conf`, we can use the following command:
 
 ```bash
-agree split -s Cargo.toml -b blueprint.yaml
+agree split -s Cargo.toml -b blueprint.conf
 ```
 
-```yaml
-threshold: 2
-generate:
-  - path: ./test/alice.share
-  - path: ./test/bob.share
-    name: bob
-    encrypt: !plain example-bob
-    info: true
-    comment: example for bob
-  - path: ./test/charlie.share
-    name: charlie
-    encrypt: 
-      shell: "printf example-charlie"
+Existing share files are not overwritten unless `--force` is supplied.
 
+```hocon
+threshold = 2
+generate = [
+  { path = "./test/alice.share" },
+  {
+    path = "./test/bob.share"
+    encrypt = { plain = "example-bob" }
+    info = true
+    comment = "example for bob"
+  },
+  {
+    path = "./test/charlie.share"
+    encrypt = { shell = "printf example-charlie" }
+  }
+]
 ```
 
 The same result can be achieved using the interactive mode:
@@ -76,46 +74,31 @@ agree split -i -s Cargo.toml
 If you use this software to generate archives that are mission critical or contain anything you really want to be able to restore, you should not solely rely on the persistence of GitHub or crates.io. It is highly recommended to either fork the version of this software or store its binaries with the shares at some point. This way, even if the ecosystem is compromised, the software is no longer maintained or distributed or in similar cases, you will still be able to access your data assuming the shares can be used (/ decrypted with the correct password).\
 For mission critical information, you should _always_ have contingency plans and never rely on single point of failures.
 
-### v0.2
+### Current archive format
 
-`v0.2` introduces a versioned `JSON` formatted archive. This archive contains the following information:
+Archives are versioned JSON documents with the following fields:
 
 * `$.version`: CLI version (`$major.$minor` format) that was used to create the archive
 * `$.uid`: Unique ID of this archive.
 * `$.pid`: Process ID of this archvie (used to make sure only archives that were created together can be used together)
-* `$.data`: `base64` encoded share data
+* `$.data`: `base64` encoded archive data containing the share payload and metadata
+
+New archives verify restoration with an HMAC-SHA512 tag. The HMAC key is embedded inside the Shamir payload before
+splitting, so fewer-than-threshold readers see only a public tag, not a reusable hash of the original secret.
+
+Secret files are limited to 64 MiB, blueprint files to 1 MiB, and share archive files to 256 MiB. This keeps accidental
+huge reads out of a tool that must hold split/restore material in memory.
+
+Encrypted share payloads derive a 32-byte key with Argon2id (`m=65536 KiB`, `t=3`, `p=1`) and encrypt with
+ChaCha20-Poly1305. The encrypted byte layout before base64 encoding is:
 
 ```
 /// |index  |usage|
 /// |-------|-----|
-/// |0 - 15 |salt |
-/// |16 - 39|nonce|
-/// |40 - 55|mac  |
-/// |56 -   |data |
+/// |0 - 31 |salt       |
+/// |32 - 43|nonce      |
+/// |44 -   |ciphertext |
 ```
 
-The password to the data is hashed via `argon2`. The hashed password is stored alongside the encrypted data to easily identify wrong passwords when the data is decrypted. The share now also contains a checksum to make sure that the restored secret is matching the original one.
-
-### v0.1
-
-Bytes `[0..36)` are reserved for the version ID of the archive.\
-In the following schematics, only the data from index `[36..]` is used and shifted left to index `0` for convenience.
-
-```
-1f2c6a6d-f711-4378-97b9-5f9e2f9f4271kldmf209fm0f944fwef98syf23f9h2fneuf2efhux...
-^     --  -- VERSION ID --  --     ^ DATA =>
-```
-
-`v0.1` is a yaml base64 encoded YAML file. The share information can be store either in plain text or can be protected with a password. The share data is always base64 encoded when stored in the YAML field.\
-If encrypted with a password, a symmetric encryption algorithm with the following attributes is used (from the crate `simplecrypt v 1.0.2`):
-
-```
-/// |index  |usage|
-/// |-------|-----|
-/// |0 - 15 |salt |
-/// |16 - 39|nonce|
-/// |40 - 55|mac  |
-/// |56 -   |data |
-```
-
-The password to the data is hashed via `argon2`. The hashed password is stored alongside the encrypted data to easily identify wrong passwords when the data is decrypted.
+Wrong passwords fail through AEAD authentication. The `info` command redacts share material, encrypted payloads, and
+authentication tags.

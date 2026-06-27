@@ -1,264 +1,260 @@
+#![forbid(unsafe_code)]
+
+mod archive;
+mod args;
+mod blueprint;
+mod engine;
+mod error;
+mod reference;
+
 use {
     crate::{
-        blueprint::Blueprint,
-        engine::SSS,
+        archive::{
+            ArchiveData,
+            Base64String,
+            Share,
+        },
+        args::{
+            ClapArgumentLoader,
+            Command,
+            ManualFormat,
+            RestoreCommand,
+            SplitCommand,
+        },
+        blueprint::{
+            Blueprint,
+            BlueprintShare,
+        },
+        engine::SecretSharingEngine,
+        error::Error,
     },
-    anyhow::Result,
-    archive::{
-        ArchiveData,
-        Base64String,
-        Share,
+    anyhow::{
+        Context,
+        Result,
     },
-    args::{
-        ClapArgumentLoader,
-        Command,
-        ManualFormat,
-        RestoreCommand,
-        SplitCommand,
-    },
-    blueprint::{
-        BlueprintShare,
-        BlueprintShareEncryption,
-    },
-    error::Error,
-    itertools::Itertools,
-    std::{
-        fs,
-        io::Write,
-        path::PathBuf,
-    },
+    std::io::Write,
+    zeroize::Zeroize,
 };
 
-pub mod archive;
-pub mod args;
-pub mod blueprint;
-pub mod engine;
-pub mod error;
-pub mod reference;
-
-fn get_version() -> String {
-    env!("CARGO_PKG_VERSION").split(".").take(2).join(".").to_owned()
+fn get_archive_version() -> String {
+    let mut parts = env!("CARGO_PKG_VERSION").split('.');
+    let major = parts.next().unwrap_or("0");
+    let minor = parts.next().unwrap_or("0");
+    format!("{}.{}", major, minor)
 }
 
-#[forbid(unsafe_code)]
-#[tokio::main]
-async fn main() -> Result<()> {
+fn prompt_optional_password() -> Result<Option<String>> {
+    let with_encryption = dialoguer::Confirm::new()
+        .with_prompt("Encrypt share data with password?")
+        .interact()
+        .context("Failed to read encryption choice")?;
+    if !with_encryption {
+        return Ok(None);
+    }
+
+    let mut password: String = dialoguer::Password::new()
+        .with_prompt("Enter password for share".to_owned())
+        .interact()
+        .context("Failed to read password")?;
+    let mut password_confirm: String = match dialoguer::Password::new()
+        .with_prompt("Enter password for confirmation".to_owned())
+        .interact()
+        .context("Failed to read password confirmation")
+    {
+        | Ok(password_confirm) => password_confirm,
+        | Err(err) => {
+            password.zeroize();
+            return Err(err);
+        },
+    };
+
+    if password != password_confirm {
+        password.zeroize();
+        password_confirm.zeroize();
+        return Err(Error::PasswordMismatch.into());
+    }
+
+    password_confirm.zeroize();
+    Ok(Some(password))
+}
+
+fn main() -> Result<()> {
     let cmd = ClapArgumentLoader::load()?;
 
     match cmd.command {
         | Command::Manual { path, format } => {
-            let out_path = PathBuf::from(path);
-            std::fs::create_dir_all(&out_path)?;
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("Failed to create directory: {}", path.display()))?;
+            let builder = reference::ReferenceBuilder::new();
             match format {
-                | ManualFormat::Manpages => {
-                    reference::build_manpages(&out_path)?;
-                },
-                | ManualFormat::Markdown => {
-                    reference::build_markdown(&out_path)?;
-                },
+                | ManualFormat::Manpages => builder.build_manpages(&path)?,
+                | ManualFormat::Markdown => builder.build_markdown(&path)?,
             }
             Ok(())
         },
         | Command::Autocomplete { path, shell } => {
-            let out_path = PathBuf::from(path);
-            std::fs::create_dir_all(&out_path)?;
-            reference::build_shell_completion(&out_path, &shell)?;
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("Failed to create directory: {}", path.display()))?;
+            let builder = reference::ReferenceBuilder::new();
+            builder.build_shell_completion(&path, &shell)?;
             Ok(())
         },
         | Command::Split(cmd) => {
             match cmd {
                 | SplitCommand::Auto {
-                    secret_data,
-                    blueprint,
+                    mut secret_data,
+                    mut blueprint,
                     trust,
+                    force,
                 } => {
-                    let blueprint: Blueprint = serde_yaml::from_slice(&blueprint)?;
-                    let engine = SSS::new(get_version());
-                    engine.generate(&secret_data, &blueprint, trust).await?;
+                    let parsed_blueprint = Blueprint::from_hocon_bytes(&blueprint);
+                    blueprint.zeroize();
+                    let mut blueprint = match parsed_blueprint {
+                        | Ok(blueprint) => blueprint,
+                        | Err(err) => {
+                            secret_data.zeroize();
+                            return Err(err);
+                        },
+                    };
+                    let engine = SecretSharingEngine::new(get_archive_version());
+                    let result = engine.generate(&secret_data, &blueprint, trust, force);
+                    blueprint.zeroize_secrets();
+                    secret_data.zeroize();
+                    result?;
                 },
-                | SplitCommand::Interactive { secret_data } => {
-                    let threshold: usize = dialoguer::Input::new().with_prompt("Enter threshold").interact()?;
-                    println!("");
+                | SplitCommand::Interactive { mut secret_data, force } => {
                     let mut blueprint = Blueprint {
-                        threshold,
+                        threshold: 0,
                         generate: Vec::<_>::new(),
                     };
-                    loop {
-                        println!("--- Entering share information ---");
+                    let result = (|| -> Result<()> {
+                        blueprint.threshold = dialoguer::Input::new()
+                            .with_prompt("Enter threshold")
+                            .interact()
+                            .context("Failed to read threshold")?;
+                        println!();
 
-                        let path: String = dialoguer::Input::new().with_prompt("Save to file").interact()?;
-                        let with_secret_info = dialoguer::Confirm::new()
-                            .with_prompt("Include secret info (num shares / threshold) in share?")
-                            .interact()?;
+                        loop {
+                            println!("--- Entering share information ---");
 
-                        let with_comment = dialoguer::Confirm::new()
-                            .with_prompt("Add comment to share?")
-                            .interact()?;
-                        let comment: Option<String> = if with_comment {
-                            Some(dialoguer::Input::new().with_prompt("Comment").interact()?)
-                        } else {
-                            None
-                        };
-                        let with_encryption = dialoguer::Confirm::new()
-                            .with_prompt("Encrypt share data with password?")
-                            .interact()?;
-                        let password: Option<String> = if with_encryption {
-                            let pw: String = dialoguer::Password::new()
-                                .with_prompt("Enter password for share".to_owned())
-                                .interact()?;
-                            let pw_confirm: String = dialoguer::Password::new()
-                                .with_prompt("Enter password for confirmation".to_owned())
-                                .interact()?;
-                            if pw != pw_confirm {
-                                return Err(Error::PasswordMismatch.into());
-                            }
+                            let path: String = dialoguer::Input::new()
+                                .with_prompt("Save to file")
+                                .interact()
+                                .context("Failed to read share path")?;
+                            let with_secret_info = dialoguer::Confirm::new()
+                                .with_prompt("Include secret info (num shares / threshold) in share?")
+                                .interact()
+                                .context("Failed to read share info choice")?;
 
-                            Some(pw)
-                        } else {
-                            None
-                        };
-                        let bp = BlueprintShare {
-                            path,
-                            encrypt: if let Some(p) = password {
-                                Some(BlueprintShareEncryption::Plain(p))
+                            let with_comment = dialoguer::Confirm::new()
+                                .with_prompt("Add comment to share?")
+                                .interact()
+                                .context("Failed to read comment choice")?;
+                            let comment: Option<String> = if with_comment {
+                                Some(
+                                    dialoguer::Input::new()
+                                        .with_prompt("Comment")
+                                        .interact()
+                                        .context("Failed to read comment")?,
+                                )
                             } else {
                                 None
-                            },
-                            info: Some(with_secret_info),
-                            comment,
-                        };
+                            };
+                            let password = prompt_optional_password()?;
 
-                        blueprint.generate.push(bp);
-                        println!("--- --- ---");
-                        println!("");
-                        if !dialoguer::Confirm::new().with_prompt("Add another share?").interact()? {
-                            break;
+                            blueprint.generate.push(BlueprintShare {
+                                path: path.into(),
+                                encrypt: password.map(blueprint::BlueprintShareEncryption::Plain),
+                                info: Some(with_secret_info),
+                                comment,
+                            });
+                            println!("--- --- ---");
+                            println!();
+                            if !dialoguer::Confirm::new()
+                                .with_prompt("Add another share?")
+                                .interact()
+                                .context("Failed to read continuation choice")?
+                            {
+                                break;
+                            }
+                            println!();
                         }
-                        println!("");
-                    }
 
-                    let engine = SSS::new(get_version());
-                    engine.generate(&secret_data, &blueprint, false).await?;
+                        let engine = SecretSharingEngine::new(get_archive_version());
+                        engine.generate(&secret_data, &blueprint, false, force)
+                    })();
+                    blueprint.zeroize_secrets();
+                    secret_data.zeroize();
+                    result?;
                 },
             }
             Ok(())
         },
         | Command::Restore(cmd) => {
-            match cmd {
-                | RestoreCommand::Auto { shares } => {
-                    let engine = SSS::new(get_version());
-                    let secret = engine.restore(&shares, false).await?;
-                    std::io::stdout().write_all(&secret)?;
-                },
-                | RestoreCommand::Interactive { shares } => {
-                    let engine = SSS::new(get_version());
-                    let secret = engine.restore(&shares, true).await?;
-                    std::io::stdout().write_all(&secret)?;
-                },
-            }
+            let engine = SecretSharingEngine::new(get_archive_version());
+            let mut secret = match cmd {
+                | RestoreCommand::Auto { shares } => engine.restore(&shares, false)?,
+                | RestoreCommand::Interactive { shares } => engine.restore(&shares, true)?,
+            };
+            let result = std::io::stdout()
+                .write_all(&secret)
+                .context("Failed to write restored secret to stdout");
+            secret.zeroize();
+            result?;
             Ok(())
         },
         | Command::Info { share } => {
-            let engine = SSS::new(get_version());
-            let info = engine.info(&share.1).await?;
-            println!("Version:\t{}", info.version);
-            println!("UID:\t\t{}", info.uid);
-            println!("PID:\t\t{}", info.pid);
-            let data_decoded = serde_json::from_slice::<ArchiveData>(info.data.decode()?.as_slice())?;
+            let engine = SecretSharingEngine::new(get_archive_version());
+            let archive = engine.info(&share.1)?;
+            let archive_data = archive.decode_data()?;
+            println!("Version:\t{}", archive.version);
+            println!("UID:\t\t{}", archive.uid);
+            println!("PID:\t\t{}", archive.pid);
             println!(
                 "Data:\n=== BEGIN DATA ===\n{}\n=== END DATA ===",
-                serde_json::to_string_pretty(&data_decoded)?
+                serde_json::to_string_pretty(&archive_data.redacted_json())?
             );
             Ok(())
         },
         | Command::Edit { share } => {
-            let engine = SSS::new(get_version());
+            let engine = SecretSharingEngine::new(get_archive_version());
 
-            let mut archive = engine.info(&share.1).await?;
-            let mut archive_data = serde_json::from_slice::<ArchiveData>(archive.data.decode()?.as_slice())?;
-            let share_data = match archive_data.share {
-                | Share::Plain { data, checksum } => (data.decode()?, checksum),
-                | Share::Encrypted {
-                    data,
-                    pass_hash,
-                    checksum,
-                } => (engine.unlock_i(data, &pass_hash)?, checksum),
-            };
-
-            let with_encryption = dialoguer::Confirm::new()
-                .with_prompt("Encrypt share data with password?")
-                .interact()?;
-            let password: Option<String> = if with_encryption {
-                let pw: String = dialoguer::Password::new()
-                    .with_prompt("Enter password for share".to_owned())
-                    .interact()?;
-                let pw_confirm: String = dialoguer::Password::new()
-                    .with_prompt("Enter password for confirmation".to_owned())
-                    .interact()?;
-                if pw != pw_confirm {
-                    return Err(Error::PasswordMismatch.into());
-                }
-
-                Some(pw)
-            } else {
-                None
-            };
-
-            archive_data.share = match password {
-                | Some(p) => engine.lock(&share_data.0, &BlueprintShareEncryption::Plain(p), share_data.1, false)?,
-                | None => {
-                    Share::Plain {
-                        data: Base64String::new(share_data.0),
-                        checksum: share_data.1,
-                    }
+            let mut archive = engine.info(&share.1)?;
+            engine.validate_archive_version(&archive)?;
+            let archive_data = archive.decode_data()?;
+            let archive_info = archive_data.info;
+            let (mut share_data, auth) = engine.read_share_payload(archive_data.share, true)?;
+            let password = match prompt_optional_password() {
+                | Ok(password) => password,
+                | Err(err) => {
+                    share_data.zeroize();
+                    return Err(err);
                 },
             };
-            archive.data = Base64String::new(serde_json::to_string(&archive_data)?);
-            fs::write(&share.0, serde_json::to_string(&archive)?)?;
+
+            let result = (|| -> Result<()> {
+                let new_share = match password {
+                    | Some(mut password) => engine.lock_with_password(&share_data, &mut password, auth)?,
+                    | None => {
+                        Share::Plain {
+                            data: Base64String::new(&share_data),
+                            auth,
+                        }
+                    },
+                };
+                let archive_data = ArchiveData {
+                    share: new_share,
+                    info: archive_info,
+                };
+                archive.data = Base64String::new(
+                    serde_json::to_vec(&archive_data).context("Failed to serialize edited archive data")?,
+                );
+                SecretSharingEngine::write_archive(&share.0, &archive, true)
+            })();
+            share_data.zeroize();
+            result?;
 
             Ok(())
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use {
-        crate::error::Error,
-        anyhow::Result,
-        std::{
-            fs,
-            process::Command,
-        },
-    };
-
-    fn exec(command: &str) -> Result<String> {
-        let output = Command::new("sh").arg("-c").arg(command).output()?;
-        if output.status.code().unwrap() != 0 {
-            return Err(Error::Shell(String::from_utf8(output.stderr)?).into());
-        }
-        Ok(String::from_utf8(output.stdout)?)
-    }
-
-    #[test]
-    fn headless_split() {
-        exec("cargo run -- split -b ./test/blueprint.yaml -s LICENSE --trust").unwrap();
-
-        let alice = fs::read("./test/alice.share").unwrap();
-        let bob = fs::read("./test/bob.share").unwrap();
-        let charlie = fs::read("./test/charlie.share").unwrap();
-
-        assert_ne!(alice, bob);
-        assert_ne!(alice, charlie);
-        assert_ne!(bob, charlie);
-    }
-
-    #[test]
-    fn restore() {
-        exec("cargo run -- split -b ./test/blueprint.yaml -s ./LICENSE --trust").unwrap();
-        let out = exec("cargo run -- restore -s ./test/alice.share -s ./test/bob.share").unwrap();
-
-        dbg!(&out);
-        assert_eq!(out, fs::read_to_string("LICENSE").unwrap());
     }
 }

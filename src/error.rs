@@ -6,10 +6,6 @@ pub enum Error {
     Argument(String),
     #[error("unknown command")]
     UnknownCommand,
-    #[error("password verification")]
-    PasswordVerification,
-    #[error("password provider")]
-    PasswordProvider,
     #[error("no trust")]
     NoTrust,
     #[error("non interactive")]
@@ -18,12 +14,12 @@ pub enum Error {
     Decoding(String),
     #[error("mismatched shares")]
     MismatchedShares,
-    #[error("checksum failed")]
-    ChecksumFailed,
+    #[error("secret authentication failed")]
+    AuthenticationFailed,
     #[error("password mismatch")]
     PasswordMismatch,
-
-    #[cfg(test)]
-    #[error("shell {0}")]
-    Shell(String),
+    #[error("duplicate share: {0}")]
+    DuplicateShare(String),
+    #[error("decryption failed")]
+    Decryption,
 }
