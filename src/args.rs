@@ -1,15 +1,27 @@
 use {
-    crate::error::Error,
+    crate::{
+        archive::ShareFile,
+        blueprint::Blueprint,
+        error::Error,
+        paths::PathResolver,
+        policy::{
+            Overwrite,
+            PromptMode,
+            ShellTrust,
+        },
+        secret::SecretBytes,
+    },
     anyhow::{
         Context,
         Result,
     },
     clap::{
+        value_parser,
         Arg,
         ArgAction,
     },
-    path_clean::PathClean,
     std::{
+        collections::HashSet,
         fs::File,
         io::Read,
         path::{
@@ -34,125 +46,90 @@ enum InputFileKind {
 impl InputFileKind {
     fn limit(self) -> u64 {
         match self {
-            | InputFileKind::Secret => MAX_SECRET_FILE_BYTES,
-            | InputFileKind::Blueprint => MAX_BLUEPRINT_FILE_BYTES,
-            | InputFileKind::Share => MAX_SHARE_FILE_BYTES,
+            | Self::Secret => MAX_SECRET_FILE_BYTES,
+            | Self::Blueprint => MAX_BLUEPRINT_FILE_BYTES,
+            | Self::Share => MAX_SHARE_FILE_BYTES,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            | InputFileKind::Secret => "secret",
-            | InputFileKind::Blueprint => "blueprint",
-            | InputFileKind::Share => "share",
+            | Self::Secret => "secret",
+            | Self::Blueprint => "blueprint",
+            | Self::Share => "share",
         }
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum Privilege {
-    Normal,
-    Experimental,
-}
-
-#[derive(Debug)]
-pub(crate) struct CallArgs {
-    pub privileges: Privilege,
-    pub command: Command,
-}
-
-impl CallArgs {
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.privileges == Privilege::Experimental {
-            return Ok(());
-        }
-
-        match &self.command {
-            | Command::Info { .. } => Err(Error::Experimental("info".to_owned()).into()),
-            | Command::Edit { .. } => Err(Error::Experimental("edit".to_owned()).into()),
-            | _ => Ok(()),
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManualFormat {
     Manpages,
     Markdown,
 }
 
-#[derive(Debug)]
+impl FromStr for ManualFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            | "manpages" => Ok(Self::Manpages),
+            | "markdown" => Ok(Self::Markdown),
+            | other => Err(format!("unknown format: {other}")),
+        }
+    }
+}
+
+pub(crate) struct CallArgs {
+    pub(crate) paths: PathResolver,
+    pub(crate) command: Command,
+}
+
 pub(crate) enum Command {
-    Manual { path: PathBuf, format: ManualFormat },
-    Autocomplete { path: PathBuf, shell: clap_complete::Shell },
+    Manual {
+        path: PathBuf,
+        format: ManualFormat,
+    },
+    Autocomplete {
+        path: PathBuf,
+        shell: clap_complete::Shell,
+    },
     Split(SplitCommand),
     Restore(RestoreCommand),
-    Info { share: (PathBuf, Vec<u8>) },
-    Edit { share: (PathBuf, Vec<u8>) },
+    /// Produced only when `--experimental` is set. The loader is the gate.
+    Experimental(ExperimentalCommand),
 }
 
-#[derive(Debug)]
+pub(crate) enum ExperimentalCommand {
+    Info(ShareFile),
+    Edit(ShareFile),
+}
+
 pub(crate) enum SplitCommand {
-    Auto {
-        secret_data: Vec<u8>,
-        blueprint: Vec<u8>,
-        trust: bool,
-        force: bool,
+    Blueprint {
+        secret: SecretBytes,
+        blueprint: Blueprint,
+        trust: ShellTrust,
+        overwrite: Overwrite,
     },
     Interactive {
-        secret_data: Vec<u8>,
-        force: bool,
+        secret: SecretBytes,
+        overwrite: Overwrite,
     },
 }
 
-#[derive(Debug)]
-pub(crate) enum RestoreCommand {
-    Auto { shares: Vec<(PathBuf, Vec<u8>)> },
-    Interactive { shares: Vec<(PathBuf, Vec<u8>)> },
+pub(crate) struct RestoreCommand {
+    pub(crate) shares: Vec<ShareFile>,
+    pub(crate) prompt: PromptMode,
 }
 
-pub(crate) struct ClapArgumentLoader {}
+pub(crate) struct ClapArgumentLoader;
 
 impl ClapArgumentLoader {
-    fn get_absolute_path(matches: &clap::ArgMatches, name: &str) -> Result<PathBuf> {
-        let path_str: &String = matches
-            .get_one(name)
-            .ok_or_else(|| Error::Argument(format!("missing path argument: {name}")))?;
-        let path = Path::new(path_str);
-        if path.is_absolute() {
-            Ok(path.to_path_buf().clean())
-        } else {
-            Ok(std::env::current_dir()
-                .context("Failed to get current directory")?
-                .join(path)
-                .clean())
-        }
-    }
-
-    fn read_file(path: &Path, kind: InputFileKind) -> Result<Vec<u8>> {
-        let file = File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
-        let limit = kind.limit();
-        let mut reader = file.take(limit + 1);
-        let mut data = Vec::new();
-        reader
-            .read_to_end(&mut data)
-            .with_context(|| format!("Failed to read file: {}", path.display()))?;
-        if data.len() as u64 > limit {
-            anyhow::bail!(
-                "{} file is too large: {} exceeds {} bytes",
-                kind.label(),
-                path.display(),
-                limit
-            );
-        }
-        Ok(data)
-    }
-
     pub(crate) fn root_command() -> clap::Command {
         clap::Command::new(env!("CARGO_PKG_NAME"))
             .version(env!("CARGO_PKG_VERSION"))
             .about(env!("CARGO_PKG_DESCRIPTION"))
-            .author("Alexander Weber <alexanderh.weber@outlook.com>")
+            .author(env!("CARGO_PKG_AUTHORS"))
             .propagate_version(true)
             .subcommand_required(true)
             .args([Arg::new("experimental")
@@ -163,9 +140,9 @@ impl ClapArgumentLoader {
             .subcommand(
                 clap::Command::new("man")
                     .about("Renders the manual.")
-                    .arg(clap::Arg::new("out").short('o').long("out").required(true))
+                    .arg(Arg::new("out").short('o').long("out").required(true))
                     .arg(
-                        clap::Arg::new("format")
+                        Arg::new("format")
                             .short('f')
                             .long("format")
                             .value_parser(["manpages", "markdown"])
@@ -175,12 +152,12 @@ impl ClapArgumentLoader {
             .subcommand(
                 clap::Command::new("autocomplete")
                     .about("Renders shell completion scripts.")
-                    .arg(clap::Arg::new("out").short('o').long("out").required(true))
+                    .arg(Arg::new("out").short('o').long("out").required(true))
                     .arg(
-                        clap::Arg::new("shell")
+                        Arg::new("shell")
                             .short('s')
                             .long("shell")
-                            .value_parser(["bash", "zsh", "fish", "elvish", "powershell"])
+                            .value_parser(value_parser!(clap_complete::Shell))
                             .required(true),
                     ),
             )
@@ -188,36 +165,36 @@ impl ClapArgumentLoader {
                 clap::Command::new("split")
                     .about("Split a secret.")
                     .arg(
-                        clap::Arg::new("interactive")
+                        Arg::new("interactive")
                             .long("interactive")
                             .short('i')
-                            .help("Interactive mode.")
+                            .help("Prompt for share destinations, threshold, and passwords.")
                             .action(ArgAction::SetTrue)
                             .conflicts_with("blueprint"),
                     )
                     .arg(
-                        clap::Arg::new("secret")
+                        Arg::new("secret")
                             .long("secret")
                             .short('s')
                             .help("Path to the file containing the secret.")
                             .required(true),
                     )
                     .arg(
-                        clap::Arg::new("blueprint")
+                        Arg::new("blueprint")
                             .long("blueprint")
                             .short('b')
                             .help("Path to the blueprint file.")
                             .required_unless_present("interactive"),
                     )
                     .arg(
-                        clap::Arg::new("trust")
+                        Arg::new("trust")
                             .long("trust")
                             .short('t')
-                            .help("Allow shell invocations from blueprint scripts.")
+                            .help("Run shell password providers from the blueprint.")
                             .action(ArgAction::SetTrue),
                     )
                     .arg(
-                        clap::Arg::new("force")
+                        Arg::new("force")
                             .long("force")
                             .short('f')
                             .help("Overwrite existing share files.")
@@ -228,7 +205,7 @@ impl ClapArgumentLoader {
                 clap::Command::new("restore")
                     .about("Restores a secret from shares.")
                     .arg(
-                        clap::Arg::new("share")
+                        Arg::new("share")
                             .long("share")
                             .short('s')
                             .help("Path to a share file.")
@@ -236,18 +213,18 @@ impl ClapArgumentLoader {
                             .action(ArgAction::Append),
                     )
                     .arg(
-                        clap::Arg::new("interactive")
+                        Arg::new("interactive")
                             .long("interactive")
                             .short('i')
-                            .help("Interactive mode.")
+                            .help("Prompt for passwords of encrypted shares.")
                             .action(ArgAction::SetTrue),
                     ),
             )
             .subcommand(
                 clap::Command::new("info")
-                    .about("Display information about a share.")
+                    .about("Display redacted information about a share.")
                     .arg(
-                        clap::Arg::new("share")
+                        Arg::new("share")
                             .long("share")
                             .short('s')
                             .help("Path to a share file.")
@@ -255,106 +232,178 @@ impl ClapArgumentLoader {
                     ),
             )
             .subcommand(
-                clap::Command::new("edit").about("Edit the share.").arg(
-                    clap::Arg::new("share")
-                        .long("share")
-                        .short('s')
-                        .help("Path to a share file.")
-                        .required(true),
-                ),
+                clap::Command::new("edit")
+                    .about("Change or remove a share password.")
+                    .arg(
+                        Arg::new("share")
+                            .long("share")
+                            .short('s')
+                            .help("Path to a share file.")
+                            .required(true),
+                    ),
             )
     }
 
     pub(crate) fn load() -> Result<CallArgs> {
-        let command = Self::root_command().get_matches();
+        let matches = Self::root_command().get_matches();
+        Self::from_matches(&matches, PathResolver::from_process()?)
+    }
 
-        let privileges = if command.get_flag("experimental") {
-            Privilege::Experimental
-        } else {
-            Privilege::Normal
-        };
-
-        let cmd = if let Some(subc) = command.subcommand_matches("man") {
+    fn from_matches(matches: &clap::ArgMatches, paths: PathResolver) -> Result<CallArgs> {
+        let experimental = matches.get_flag("experimental");
+        let command = if let Some(sub) = matches.subcommand_matches("man") {
             Command::Manual {
-                path: Self::get_absolute_path(subc, "out")?,
-                format: match subc
-                    .get_one::<String>("format")
-                    .ok_or_else(|| Error::Argument("missing format argument".to_owned()))?
-                    .as_str()
-                {
-                    | "manpages" => ManualFormat::Manpages,
-                    | "markdown" => ManualFormat::Markdown,
-                    | _ => return Err(Error::Argument("unknown format".into()).into()),
-                },
+                path: paths.resolve(required_str(sub, "out")?)?,
+                format: ManualFormat::from_str(required_str(sub, "format")?).map_err(|err| anyhow::anyhow!(err))?,
             }
-        } else if let Some(subc) = command.subcommand_matches("autocomplete") {
+        } else if let Some(sub) = matches.subcommand_matches("autocomplete") {
             Command::Autocomplete {
-                path: Self::get_absolute_path(subc, "out")?,
-                shell: clap_complete::Shell::from_str(
-                    subc.get_one::<String>("shell")
-                        .ok_or_else(|| Error::Argument("missing shell argument".to_owned()))?
-                        .as_str(),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to parse shell: {}", e))?,
+                path: paths.resolve(required_str(sub, "out")?)?,
+                shell: *sub
+                    .get_one::<clap_complete::Shell>("shell")
+                    .context("missing shell argument")?,
             }
-        } else if let Some(subc) = command.subcommand_matches("split") {
-            let secret_path = Self::get_absolute_path(subc, "secret")?;
-            if subc.get_flag("interactive") {
-                Command::Split(SplitCommand::Interactive {
-                    secret_data: Self::read_file(&secret_path, InputFileKind::Secret)?,
-                    force: subc.get_flag("force"),
-                })
+        } else if let Some(sub) = matches.subcommand_matches("split") {
+            let secret = SecretBytes::new(Self::read_file(
+                &paths.resolve(required_str(sub, "secret")?)?,
+                InputFileKind::Secret,
+            )?);
+            let overwrite = Overwrite::from_flag(sub.get_flag("force"));
+            if sub.get_flag("interactive") {
+                Command::Split(SplitCommand::Interactive { secret, overwrite })
             } else {
-                let blueprint_path = Self::get_absolute_path(subc, "blueprint")?;
-                Command::Split(SplitCommand::Auto {
-                    secret_data: Self::read_file(&secret_path, InputFileKind::Secret)?,
-                    blueprint: Self::read_file(&blueprint_path, InputFileKind::Blueprint)?,
-                    trust: subc.get_flag("trust"),
-                    force: subc.get_flag("force"),
+                let blueprint_bytes = SecretBytes::new(Self::read_file(
+                    &paths.resolve(required_str(sub, "blueprint")?)?,
+                    InputFileKind::Blueprint,
+                )?);
+                let blueprint = Blueprint::from_hocon(blueprint_bytes.as_slice(), &paths)?;
+                Command::Split(SplitCommand::Blueprint {
+                    secret,
+                    blueprint,
+                    trust: ShellTrust::from_flag(sub.get_flag("trust")),
+                    overwrite,
                 })
             }
-        } else if let Some(subc) = command.subcommand_matches("restore") {
-            let shares_args = subc
-                .get_many::<String>("share")
-                .ok_or_else(|| Error::Argument("missing share argument".to_owned()))?;
-            let mut shares = Vec::<(PathBuf, Vec<u8>)>::new();
-            for share in shares_args {
-                let path = if Path::new(share).is_absolute() {
-                    PathBuf::from(share).clean()
-                } else {
-                    std::env::current_dir()
-                        .context("Failed to get current directory")?
-                        .join(share)
-                        .clean()
-                };
-                shares.push((path.clone(), Self::read_file(&path, InputFileKind::Share)?));
-            }
-
-            if subc.get_flag("interactive") {
-                Command::Restore(RestoreCommand::Interactive { shares })
-            } else {
-                Command::Restore(RestoreCommand::Auto { shares })
-            }
-        } else if let Some(subc) = command.subcommand_matches("info") {
-            let path = Self::get_absolute_path(subc, "share")?;
-            Command::Info {
-                share: (path.clone(), Self::read_file(&path, InputFileKind::Share)?),
-            }
-        } else if let Some(subc) = command.subcommand_matches("edit") {
-            let path = Self::get_absolute_path(subc, "share")?;
-            Command::Edit {
-                share: (path.clone(), Self::read_file(&path, InputFileKind::Share)?),
-            }
+        } else if let Some(sub) = matches.subcommand_matches("restore") {
+            Command::Restore(RestoreCommand {
+                shares: Self::read_shares(sub, &paths)?,
+                prompt: PromptMode::from_flag(sub.get_flag("interactive")),
+            })
+        } else if let Some(sub) = matches.subcommand_matches("info") {
+            ensure_experimental(experimental, "info")?;
+            Command::Experimental(ExperimentalCommand::Info(Self::read_one_share(sub, &paths)?))
+        } else if let Some(sub) = matches.subcommand_matches("edit") {
+            ensure_experimental(experimental, "edit")?;
+            Command::Experimental(ExperimentalCommand::Edit(Self::read_one_share(sub, &paths)?))
         } else {
-            return Err(Error::UnknownCommand.into());
+            anyhow::bail!("unknown command");
         };
 
-        let callargs = CallArgs {
-            privileges,
-            command: cmd,
-        };
+        Ok(CallArgs { paths, command })
+    }
 
-        callargs.validate()?;
-        Ok(callargs)
+    fn read_one_share(matches: &clap::ArgMatches, paths: &PathResolver) -> Result<ShareFile> {
+        let path = paths.resolve(required_str(matches, "share")?)?;
+        let bytes = Self::read_file(&path, InputFileKind::Share)?;
+        Ok(ShareFile::new(path, bytes))
+    }
+
+    fn read_shares(matches: &clap::ArgMatches, paths: &PathResolver) -> Result<Vec<ShareFile>> {
+        let args = matches.get_many::<String>("share").context("missing share argument")?;
+        let mut files = Vec::new();
+        let mut seen = HashSet::new();
+        for share in args {
+            let path = paths.resolve(share)?;
+            if !seen.insert(path.clone()) {
+                anyhow::bail!("duplicate share path: {}", path.display());
+            }
+            let bytes = Self::read_file(&path, InputFileKind::Share)?;
+            files.push(ShareFile::new(path, bytes));
+        }
+        Ok(files)
+    }
+
+    fn read_file(path: &Path, kind: InputFileKind) -> Result<Vec<u8>> {
+        let file = File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+        let limit = kind.limit();
+        let mut reader = file.take(limit.saturating_add(1));
+        let mut data = Vec::new();
+        reader
+            .read_to_end(&mut data)
+            .with_context(|| format!("Failed to read file: {}", path.display()))?;
+        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if len > limit {
+            anyhow::bail!(
+                "{} file is too large: {} exceeds {limit} bytes",
+                kind.label(),
+                path.display()
+            );
+        }
+        Ok(data)
+    }
+}
+
+fn required_str<'a>(matches: &'a clap::ArgMatches, name: &str) -> Result<&'a str> {
+    matches
+        .get_one::<String>(name)
+        .map(String::as_str)
+        .with_context(|| format!("missing {name} argument"))
+}
+
+fn ensure_experimental(enabled: bool, command: &'static str) -> Result<()> {
+    if enabled {
+        return Ok(());
+    }
+    Err(Error::Experimental { command }.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{
+            ensure_experimental,
+            ClapArgumentLoader,
+            InputFileKind,
+        },
+        std::{
+            fs,
+            path::PathBuf,
+        },
+        uuid::Uuid,
+    };
+
+    #[test]
+    fn experimental_commands_are_rejected_without_the_flag() {
+        assert!(ensure_experimental(false, "info").is_err());
+        assert!(ensure_experimental(true, "edit").is_ok());
+    }
+
+    #[test]
+    fn rejects_files_over_the_limit() {
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(std::env::temp_dir().join(format!("agree-args-{}", Uuid::new_v4())));
+        fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("blueprint.conf");
+        fs::write(&path, vec![b'a'; (1024 * 1024) + 1]).unwrap();
+        let err = ClapArgumentLoader::read_file(&path, InputFileKind::Blueprint).unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn info_without_experimental_is_rejected_by_clap_load() {
+        let matches = ClapArgumentLoader::root_command()
+            .try_get_matches_from(["agree", "info", "-s", "missing.share"])
+            .unwrap();
+        let Err(err) =
+            ClapArgumentLoader::from_matches(&matches, crate::paths::PathResolver::with_cwd(PathBuf::from(".")))
+        else {
+            panic!("info without --experimental must fail");
+        };
+        assert!(err.to_string().contains("--experimental"));
     }
 }
