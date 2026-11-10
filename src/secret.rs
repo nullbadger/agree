@@ -7,12 +7,11 @@ use {
     },
 };
 
-/// Maximum accepted share password, including shell-provider output after
-/// newline trimming.
+/// Maximum accepted share password, including a stdin line after newline
+/// trimming.
 pub(crate) const MAX_PASSWORD_BYTES: usize = 4096;
 
-/// A share password. The buffer is cleared when the value is dropped, including
-/// on error paths.
+/// A share password. The buffer is cleared when the value is dropped.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct Password(String);
 
@@ -31,10 +30,6 @@ impl Password {
         Ok(Self(value))
     }
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
@@ -43,35 +38,6 @@ impl Password {
 impl fmt::Debug for Password {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Password(<redacted>)")
-    }
-}
-
-/// Owned secret material. Drop clears the buffer, so callers do not zeroize by
-/// hand.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub(crate) struct SecretBytes(Vec<u8>);
-
-impl SecretBytes {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub(crate) fn split_off(&mut self, at: usize) -> Self {
-        Self(self.0.split_off(at))
-    }
-}
-
-impl fmt::Debug for SecretBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SecretBytes(<redacted>)")
     }
 }
 
@@ -86,9 +52,6 @@ mod tests {
     fn rejects_empty_and_overlong_passwords() {
         assert!(Password::new(String::new()).is_err());
         assert!(Password::new("x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
-        assert_eq!(
-            Password::new("correct horse".to_owned()).unwrap().as_str(),
-            "correct horse"
-        );
+        assert!(Password::new("correct horse".to_owned()).is_ok());
     }
 }

@@ -1,362 +1,425 @@
+//! Split and restore.
+//!
+//! The secret is streamed. Shares hold only a Shamir share of the data key,
+//! plus a commitment to the sealed bytes. The key length is a multiple of 32.
+//! Each 32-byte piece is one encryption layer. Fewer than `threshold` shares
+//! cannot produce a key that authenticates.
+
 use {
     crate::{
-        archive::{
-            Archive,
-            ArchiveData,
-            ArchiveVersion,
-            AuthTag,
-            GroupId,
-            SecretInfo,
-            Share,
-            ShareBody,
-            ShareFile,
-            ShareInfo,
-        },
-        blueprint::Blueprint,
         crypto::{
-            SecretAuthenticator,
+            validate_key_bytes,
+            SecretCipher,
             ShareCipher,
+            CHUNK_LEN,
         },
         error::Error,
-        policy::{
-            Overwrite,
-            PromptMode,
-            ShellTrust,
+        format::{
+            commitment_eq,
+            SealedHeader,
+            SealedReader,
+            SealedWriter,
+            ShareRecord,
         },
-        prompt::PasswordPrompt,
-        scheme::{
-            ShareCount,
-            Threshold,
-        },
-        secret::{
-            Password,
-            SecretBytes,
-        },
-        store::{
-            ShareOutput,
-            SharePublisher,
-        },
+        memory::DataKey,
+        secret::Password,
+        store::create_private_file,
     },
     anyhow::{
+        bail,
         Context,
         Result,
+    },
+    rand_core::{
+        OsRng,
+        RngCore,
     },
     shamirs::{
         Share as ShamirShare,
         Sharks,
     },
     std::{
-        collections::HashSet,
-        path::Path,
+        fs::File,
+        io::{
+            Read,
+            Write,
+        },
+        path::PathBuf,
     },
     zeroize::Zeroize,
 };
 
-/// Splits and restores secrets. Crypto, file publishing, and password prompts
-/// stay in their own types.
-pub(crate) struct SecretSharingEngine {
-    version: ArchiveVersion,
-    cipher: ShareCipher,
-    authenticator: SecretAuthenticator,
+pub(crate) struct Engine {
+    shares: ShareCipher,
+    temp: PathBuf,
 }
 
-impl SecretSharingEngine {
-    pub(crate) fn new(version: ArchiveVersion) -> Self {
+impl Engine {
+    pub(crate) fn new(temp: PathBuf) -> Self {
         Self {
-            authenticator: SecretAuthenticator::new(&version),
-            cipher: ShareCipher::new(),
-            version,
+            shares: ShareCipher::new(),
+            temp,
         }
     }
 
-    pub(crate) fn split(
+    pub(crate) fn split<R: Read, W: Write>(
         &self,
-        secret: &SecretBytes,
-        blueprint: &Blueprint,
-        trust: ShellTrust,
-        overwrite: Overwrite,
-    ) -> Result<()> {
-        blueprint.ensure_trust(trust)?;
-        SharePublisher::ensure_available(blueprint.paths(), overwrite)?;
-        let passwords = blueprint.resolve_passwords(trust)?;
-        // A trusted provider can create an output path while it runs. Check again
-        // before splitting.
-        SharePublisher::ensure_available(blueprint.paths(), overwrite)?;
-
-        let (auth, mut shamir_shares) = {
-            let (payload, auth) = self.authenticator.seal(secret.as_slice())?;
-            let shares = deal(&payload, blueprint.threshold(), blueprint.shares().len())?;
-            (auth, shares)
-        };
-        let group = GroupId::new();
-        let mut outputs = Vec::with_capacity(blueprint.shares().len());
-        for ((share, password), shamir_share) in blueprint.shares().iter().zip(&passwords).zip(&shamir_shares) {
-            let share_bytes = SecretBytes::new(Vec::<u8>::from(shamir_share));
-            let sealed = match password {
-                | Some(password) => Share::encrypted(self.cipher.seal(share_bytes.as_slice(), password)?, auth.clone()),
-                | None => Share::plain(share_bytes, auth.clone()),
-            };
-            let info = ShareInfo::new(
-                share.comment().map(str::to_owned),
-                if share.include_info() {
-                    Some(blueprint.secret_info()?)
-                } else {
-                    None
-                },
-            );
-            let archive = Archive::create(self.version, group, &ArchiveData::new(sealed, info))?;
-            outputs.push(ShareOutput::new(
-                share.path().to_path_buf(),
-                SecretBytes::new(archive.to_vec()?),
-            ));
-        }
-        shamir_shares.zeroize();
-        SharePublisher::publish(&outputs, overwrite)
-    }
-
-    pub(crate) fn restore<P: PasswordPrompt>(
-        &self,
-        shares: &[ShareFile],
-        mode: PromptMode,
-        prompt: &mut P,
-    ) -> Result<SecretBytes> {
-        if shares.is_empty() {
-            anyhow::bail!("At least one share is required");
-        }
-        if shares.len() > ShareCount::MAX {
-            anyhow::bail!("too many shares: {} exceeds {}", shares.len(), ShareCount::MAX);
-        }
-
-        let mut shamir_shares = Vec::with_capacity(shares.len());
-        let mut seen_uids = HashSet::new();
-        let mut seen_indexes = HashSet::new();
-        let mut secret_info = None;
-        let mut expected = None;
-        let restored = (|| -> Result<SecretBytes> {
-            for file in shares {
-                let archive = Archive::parse(file.bytes())
-                    .with_context(|| format!("Failed to parse share archive: {}", file.path().display()))?;
-                self.ensure_version(&archive, file.path())?;
-                if !seen_uids.insert(archive.uid()) {
-                    return Err(Error::DuplicateShare {
-                        path: file.path().display().to_string(),
-                    }
-                    .into());
-                }
-                let (share, info) = archive
-                    .archive_data()
-                    .with_context(|| format!("Failed to decode share archive data: {}", file.path().display()))?
-                    .into_parts();
-                note_secret_info(&mut secret_info, info.secret(), file.path())?;
-                let (payload, auth) = self.unlock(share, mode, prompt, file.path())?;
-                match &expected {
-                    | None => expected = Some((archive.group_id(), auth.clone())),
-                    | Some((group, expected_auth)) if *group != archive.group_id() => {
-                        anyhow::bail!("share {} was created in a different split", file.path().display());
-                    },
-                    | Some((_, expected_auth)) if expected_auth != &auth => {
-                        anyhow::bail!(
-                            "share {} has a different authentication tag than the other shares",
-                            file.path().display()
-                        );
-                    },
-                    | Some(_) => {},
-                }
-                let index = share_index(payload.as_slice())?;
-                if !seen_indexes.insert(index) {
-                    return Err(Error::DuplicateShare {
-                        path: file.path().display().to_string(),
-                    }
-                    .into());
-                }
-                let shamir = ShamirShare::try_from(payload.as_slice()).map_err(|err| {
-                    anyhow::anyhow!("Share payload has invalid format: {}: {err}", file.path().display())
-                })?;
-                shamir_shares.push(shamir);
+        secret: &mut R,
+        sealed: &mut W,
+        threshold: u8,
+        key_bytes: u16,
+        passwords: &[Option<Password>],
+        key: Option<DataKey>,
+    ) -> Result<SplitOutput> {
+        let count = u8::try_from(passwords.len()).context("too many shares")?;
+        validate_scheme(threshold, count)?;
+        let key_len = validate_key_bytes(key_bytes)?;
+        if let Some(provided) = &key {
+            if provided.as_bytes().len() != key_len {
+                bail!("provided key length does not match --key-bytes");
             }
-
-            let threshold = restore_threshold(secret_info, shamir_shares.len())?;
-            let (_, auth) = expected.context("no shares were provided")?;
-            let sharks = Sharks(threshold.get());
-            let mut recovered = sharks
-                .recover(shamir_shares.as_slice())
-                .map_err(|err| anyhow::anyhow!("Failed to restore secret from shares: {err}"))?;
-            let payload = SecretBytes::new(std::mem::take(&mut *recovered));
-            self.authenticator.open(payload, &auth)
-        })();
-        shamir_shares.zeroize();
-        restored
-    }
-
-    pub(crate) fn edit<P: PasswordPrompt>(
-        &self,
-        file: &ShareFile,
-        new_password: Option<Password>,
-        prompt: &mut P,
-    ) -> Result<()> {
-        let mut archive = Archive::parse(file.bytes())
-            .with_context(|| format!("Failed to parse share archive: {}", file.path().display()))?;
-        self.ensure_version(&archive, file.path())?;
-        let (share, info) = archive.archive_data()?.into_parts();
-        let (payload, auth) = self.unlock(share, PromptMode::Interactive, prompt, file.path())?;
-        let resealed = match &new_password {
-            | Some(password) => Share::encrypted(self.cipher.seal(payload.as_slice(), password)?, auth),
-            | None => Share::plain(payload, auth),
-        };
-        archive.set_data(&ArchiveData::new(resealed, info))?;
-        SharePublisher::publish(
-            &[ShareOutput::new(
-                file.path().to_path_buf(),
-                SecretBytes::new(archive.to_vec()?),
-            )],
-            Overwrite::Replace,
-        )
-    }
-
-    fn ensure_version(&self, archive: &Archive, path: &Path) -> Result<()> {
-        if archive.version() != self.version {
-            anyhow::bail!(
-                "Unsupported archive version {} in {}; this binary supports {}",
-                archive.version(),
-                path.display(),
-                self.version
-            );
         }
+        let mut group = [0u8; 16];
+        OsRng.fill_bytes(&mut group);
+        let cipher = match key {
+            | Some(key) => SecretCipher::from_key(key, group, threshold, count),
+            | None => SecretCipher::generate(group, threshold, count, key_len),
+        };
+        let header = SealedHeader {
+            threshold,
+            count,
+            key_bytes,
+            group,
+            nonce_prefix: *cipher.nonce_prefix(),
+        };
+        let mut writer = SealedWriter::new(&mut *sealed, &header)?;
+        stream_encrypt(&cipher, secret, &mut writer)?;
+        let commitment = writer.commitment();
+        let shamir = deal(cipher.key_bytes(), threshold, usize::from(count))?;
+        let mut encoded = Vec::with_capacity(passwords.len());
+        for (index, (body, password)) in shamir.iter().zip(passwords).enumerate() {
+            let mut record = ShareRecord {
+                index: u8::try_from(index + 1).expect("count fits in u8"),
+                threshold,
+                count,
+                key_bytes,
+                group,
+                commitment,
+                password: password.is_some(),
+                body: body.clone(),
+            };
+            if let Some(password) = password {
+                let aad = record.aad();
+                record.body = self.shares.seal(body, password, &aad)?;
+            }
+            encoded.push(record.encode()?);
+        }
+        Ok(SplitOutput {
+            group,
+            threshold,
+            count,
+            key_bytes,
+            shares: encoded,
+        })
+    }
+
+    pub(crate) fn restore<R: Read, W: Write>(
+        &self,
+        sealed: R,
+        output: &mut W,
+        encoded: &[Vec<u8>],
+        passwords: &[Option<Password>],
+    ) -> Result<()> {
+        if encoded.len() != passwords.len() {
+            bail!("password count does not match share count");
+        }
+        let records = decode_shares(encoded)?;
+        let opened = self.open_shares(&records, passwords)?;
+        let threshold = records[0].threshold;
+        if opened.len() < usize::from(threshold) {
+            return Err(Error::NeedShares {
+                need: threshold,
+                got: opened.len(),
+            }
+            .into());
+        }
+        let staged = self.stage_sealed(sealed)?;
+        if !commitment_eq(&staged.commitment, &records[0].commitment) {
+            return Err(Error::WrongGroup.into());
+        }
+        if staged.header.group != records[0].group
+            || staged.header.threshold != records[0].threshold
+            || staged.header.count != records[0].count
+            || staged.header.key_bytes != records[0].key_bytes
+        {
+            return Err(Error::WrongGroup.into());
+        }
+        let key = recover(&opened, threshold, usize::from(records[0].key_bytes))?;
+        let cipher = SecretCipher::open(
+            key,
+            staged.header.nonce_prefix,
+            staged.header.group,
+            staged.header.threshold,
+            staged.header.count,
+        );
+        decrypt_staged(&cipher, &staged, output)?;
         Ok(())
     }
 
-    fn unlock<P: PasswordPrompt>(
-        &self,
-        share: Share,
-        mode: PromptMode,
-        prompt: &mut P,
-        path: &Path,
-    ) -> Result<(SecretBytes, AuthTag)> {
-        match share.into_parts() {
-            | (ShareBody::Plain(data), auth) => Ok((data, auth)),
-            | (ShareBody::Encrypted(data), auth) => {
-                if mode != PromptMode::Interactive {
-                    return Err(Error::PasswordRequired.into());
-                }
-                let password = prompt.password(&format!("Enter password for {}", path.display()))?;
-                let opened = self.cipher.open(data.as_slice(), &password)?;
-                Ok((opened, auth))
-            },
+    fn open_shares(&self, records: &[ShareRecord], passwords: &[Option<Password>]) -> Result<Vec<Vec<u8>>> {
+        let mut opened = Vec::with_capacity(records.len());
+        for (record, password) in records.iter().zip(passwords) {
+            let body = if record.password {
+                let password = password.as_ref().ok_or(Error::PasswordRequired)?;
+                self.shares.open(&record.body, password, &record.aad())?
+            } else {
+                record.body.clone()
+            };
+            if body.first().copied() != Some(record.index) {
+                return Err(Error::AuthenticationFailed.into());
+            }
+            opened.push(body);
         }
+        Ok(opened)
+    }
+
+    fn stage_sealed<R: Read>(&self, sealed: R) -> Result<StagedSealed> {
+        let mut reader = SealedReader::open(sealed)?;
+        let path = self.temp.join(temp_name());
+        let mut file = create_private_file(&path)?;
+        let mut saw_last = false;
+        while let Some((last, ciphertext)) = reader.next_chunk()? {
+            if saw_last {
+                bail!("sealed secret has data after the final chunk");
+            }
+            write_frame(&mut file, last, &ciphertext)?;
+            saw_last = last;
+            if last {
+                break;
+            }
+        }
+        if !saw_last {
+            bail!("sealed secret ended before the final chunk");
+        }
+        file.sync_all().ok();
+        Ok(StagedSealed {
+            path,
+            header: reader.header.clone(),
+            commitment: reader.commitment(),
+        })
     }
 }
 
-fn deal(payload: &SecretBytes, threshold: Threshold, count: usize) -> Result<Vec<ShamirShare>> {
-    let shares: Vec<_> = Sharks(threshold.get()).dealer(payload.as_slice()).take(count).collect();
+pub(crate) struct SplitOutput {
+    pub(crate) group: [u8; 16],
+    pub(crate) threshold: u8,
+    pub(crate) count: u8,
+    pub(crate) key_bytes: u16,
+    pub(crate) shares: Vec<Vec<u8>>,
+}
+
+struct StagedSealed {
+    path: PathBuf,
+    header: SealedHeader,
+    commitment: [u8; 32],
+}
+
+impl Drop for StagedSealed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn validate_scheme(threshold: u8, count: u8) -> Result<()> {
+    if threshold == 0 || count == 0 {
+        bail!("threshold and share count must be greater than 0");
+    }
+    if threshold > count {
+        bail!("threshold {threshold} exceeds share count {count}");
+    }
+    Ok(())
+}
+
+fn stream_encrypt<R: Read, W: Write>(
+    cipher: &SecretCipher,
+    secret: &mut R,
+    sealed: &mut SealedWriter<W>,
+) -> Result<()> {
+    let mut buf = vec![0u8; CHUNK_LEN];
+    let mut pending: Option<Vec<u8>> = None;
+    let mut counter = 0u32;
+    loop {
+        let read = secret.read(&mut buf).context("Failed to read secret")?;
+        if read == 0 {
+            let mut last = pending.take().unwrap_or_default();
+            let ciphertext = cipher.encrypt_chunk(counter, true, &last)?;
+            sealed.write_chunk(true, &ciphertext)?;
+            last.zeroize();
+            break;
+        }
+        if let Some(mut previous) = pending.take() {
+            let ciphertext = cipher.encrypt_chunk(counter, false, &previous)?;
+            sealed.write_chunk(false, &ciphertext)?;
+            previous.zeroize();
+            counter = counter.checked_add(1).context("secret is too large to seal")?;
+        }
+        pending = Some(buf[..read].to_vec());
+        buf[..read].zeroize();
+    }
+    Ok(())
+}
+
+fn deal(key: &[u8], threshold: u8, count: usize) -> Result<Vec<Vec<u8>>> {
+    if key.is_empty() || !key.len().is_multiple_of(32) {
+        bail!("data key must be a multiple of 32 bytes");
+    }
+    let sharks = Sharks(threshold);
+    let shares: Vec<ShamirShare> = sharks.dealer(key).take(count).collect();
     if shares.len() != count {
-        anyhow::bail!(
-            "Share generation returned {} shares for {count} requested outputs",
-            shares.len()
-        );
+        bail!("share generation returned {} shares, expected {count}", shares.len());
     }
-    Ok(shares)
+    let mut encoded = Vec::with_capacity(count);
+    for (expected, share) in (1..=count).zip(&shares) {
+        let bytes = Vec::<u8>::from(share);
+        if bytes.first().copied() != Some(u8::try_from(expected).expect("index fits")) {
+            bail!("generated share index does not match its position");
+        }
+        encoded.push(bytes);
+    }
+    Ok(encoded)
 }
 
-fn share_index(bytes: &[u8]) -> Result<u8> {
-    let index = *bytes.first().context("share payload is empty")?;
-    if index == 0 {
-        anyhow::bail!("share index 0 is not valid");
+fn recover(shares: &[Vec<u8>], threshold: u8, key_len: usize) -> Result<DataKey> {
+    let parsed = shares
+        .iter()
+        .map(|bytes| ShamirShare::try_from(bytes.as_slice()).map_err(|err| anyhow::anyhow!(err)))
+        .collect::<Result<Vec<_>>>()?;
+    let sharks = Sharks(threshold);
+    let recovered = sharks.recover(parsed.iter()).map_err(|_| Error::AuthenticationFailed)?;
+    if recovered.len() != key_len {
+        return Err(Error::AuthenticationFailed.into());
     }
-    Ok(index)
+    Ok(DataKey::from_bytes(recovered.to_vec()))
 }
 
-fn note_secret_info(current: &mut Option<SecretInfo>, next: Option<SecretInfo>, path: &Path) -> Result<()> {
-    let Some(next) = next else {
-        return Ok(());
-    };
-    match current {
-        | Some(current) if *current != next => {
-            anyhow::bail!("share {} metadata does not match the other shares", path.display());
-        },
-        | Some(_) => Ok(()),
-        | None => {
-            *current = Some(next);
-            Ok(())
-        },
+fn decode_shares(encoded: &[Vec<u8>]) -> Result<Vec<ShareRecord>> {
+    if encoded.is_empty() {
+        bail!("at least one share is required");
     }
+    let mut records: Vec<ShareRecord> = Vec::with_capacity(encoded.len());
+    let mut seen = Vec::new();
+    for bytes in encoded {
+        let record = ShareRecord::decode(bytes)?;
+        if seen.contains(&record.index) {
+            return Err(Error::DuplicateShare.into());
+        }
+        seen.push(record.index);
+        if let Some(first) = records.first() {
+            if record.group != first.group
+                || record.threshold != first.threshold
+                || record.count != first.count
+                || record.key_bytes != first.key_bytes
+                || !commitment_eq(&record.commitment, &first.commitment)
+            {
+                return Err(Error::WrongGroup.into());
+            }
+        }
+        if record.threshold == 0 || record.threshold > record.count {
+            bail!("share has an invalid threshold");
+        }
+        if records.len() >= usize::from(record.count) {
+            bail!("received more shares than this secret was split into");
+        }
+        records.push(record);
+    }
+    Ok(records)
 }
 
-fn restore_threshold(info: Option<SecretInfo>, received: usize) -> Result<Threshold> {
-    let Some(info) = info else {
-        return Threshold::new(received).context("invalid restore threshold");
-    };
-    if received < info.threshold().as_usize() {
-        anyhow::bail!(
-            "Need at least {} shares to restore this secret; received {received}",
-            info.threshold().as_usize()
-        );
+fn decrypt_staged<W: Write>(cipher: &SecretCipher, staged: &StagedSealed, output: &mut W) -> Result<()> {
+    let mut file = File::open(&staged.path).context("Failed to read staged sealed secret")?;
+    let mut counter = 0u32;
+    let mut saw_last = false;
+    loop {
+        let Some((last, ciphertext)) = read_frame(&mut file)? else {
+            break;
+        };
+        if saw_last {
+            bail!("staged sealed secret is corrupt");
+        }
+        let mut plaintext = cipher.decrypt_chunk(counter, last, &ciphertext)?;
+        output
+            .write_all(&plaintext)
+            .context("Failed to write restored secret")?;
+        plaintext.zeroize();
+        saw_last = last;
+        if last {
+            break;
+        }
+        counter = counter.checked_add(1).context("sealed secret is corrupt")?;
     }
-    if received > info.num_shares().get() {
-        anyhow::bail!(
-            "Received {received} shares, but this secret only has {} generated shares",
-            info.num_shares().get()
-        );
+    if !saw_last {
+        bail!("staged sealed secret is corrupt");
     }
-    Ok(info.threshold())
+    Ok(())
+}
+
+fn write_frame(file: &mut File, last: bool, ciphertext: &[u8]) -> Result<()> {
+    let len = u32::try_from(ciphertext.len()).context("sealed chunk is too large")?;
+    file.write_all(&[u8::from(last)])?;
+    file.write_all(&len.to_be_bytes())?;
+    file.write_all(ciphertext)?;
+    Ok(())
+}
+
+fn read_frame(file: &mut File) -> Result<Option<(bool, Vec<u8>)>> {
+    let mut last = [0u8; 1];
+    match file.read(&mut last)? {
+        | 0 => return Ok(None),
+        | 1 => {},
+        | _ => unreachable!("one-byte read"),
+    }
+    let mut len_bytes = [0u8; 4];
+    file.read_exact(&mut len_bytes)?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > crate::format::MAX_CHUNK_CIPHERTEXT {
+        bail!("sealed chunk is too large");
+    }
+    let mut ciphertext = vec![0u8; len];
+    file.read_exact(&mut ciphertext)?;
+    Ok(Some((last[0] == 1, ciphertext)))
+}
+
+fn temp_name() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("agree-sealed-{}.tmp", crate::location::encode_hex(&bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use {
-        super::SecretSharingEngine,
+        super::Engine,
         crate::{
-            archive::{
-                Archive,
-                ArchiveVersion,
-            },
-            blueprint::{
-                Blueprint,
-                BlueprintShareEncryption,
-                ShareSpec,
-            },
-            paths::PathResolver,
-            policy::{
-                Overwrite,
-                PromptMode,
-                ShellTrust,
-            },
-            prompt::PasswordPrompt,
-            secret::{
-                Password,
-                SecretBytes,
-            },
-        },
-        anyhow::{
-            Context,
-            Result,
-        },
-        base64::{
-            engine::general_purpose::STANDARD,
-            Engine,
-        },
-        shamirs::{
-            Share as ShamirShare,
-            Sharks,
+            format::ShareRecord,
+            memory::DataKey,
+            secret::Password,
         },
         std::{
             fs,
-            path::{
-                Path,
-                PathBuf,
-            },
+            io::Cursor,
+            path::PathBuf,
         },
-        uuid::Uuid,
     };
-
-    const SECRET: &[u8] = b"correct horse battery staple";
 
     struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new() -> Result<Self> {
-            let path = std::env::temp_dir().join(format!("agree-test-{}", Uuid::new_v4()));
-            fs::create_dir_all(&path)?;
-            Ok(Self(path))
+        fn new() -> Self {
+            let mut name = [0u8; 8];
+            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut name);
+            let path = std::env::temp_dir().join(format!("agree-engine-{}", crate::location::encode_hex(&name)));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
         }
     }
 
@@ -366,412 +429,352 @@ mod tests {
         }
     }
 
-    struct ScriptedPrompt {
-        passwords: Vec<Password>,
+    fn engine(dir: &TempDir) -> Engine {
+        Engine::new(dir.0.clone())
     }
 
-    impl PasswordPrompt for ScriptedPrompt {
-        fn password(&mut self, _: &str) -> Result<Password> {
-            if self.passwords.is_empty() {
-                anyhow::bail!("no scripted password");
+    fn roundtrip(secret: &[u8], threshold: u8, passwords: &[Option<Password>]) {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(&mut Cursor::new(secret), &mut sealed, threshold, 32, passwords, None)
+            .unwrap();
+        assert_eq!(split.shares.len(), passwords.len());
+        if secret.len() >= 16 {
+            for share in &split.shares {
+                assert!(!share.windows(secret.len()).any(|window| window == secret));
             }
-            Ok(self.passwords.remove(0))
+        }
+        let mut restored = Vec::new();
+        engine
+            .restore(Cursor::new(sealed), &mut restored, &split.shares, passwords)
+            .unwrap();
+        assert_eq!(restored, secret);
+    }
+
+    #[test]
+    fn restores_empty_small_and_multichunk_secrets() {
+        roundtrip(b"", 1, &[None]);
+        roundtrip(b"signing-key", 2, &[None, None, None]);
+        let mut large = vec![0u8; 70_000];
+        large[0] = 1;
+        large[65_000] = 2;
+        large[69_999] = 3;
+        roundtrip(&large, 3, &[None, None, None, None, None]);
+    }
+
+    #[test]
+    fn password_and_threshold_are_enforced() {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let password = Password::new("share-password".to_owned()).unwrap();
+        let mut sealed = Vec::new();
+        let passwords = [None, Some(password.clone()), None];
+        let split = engine
+            .split(&mut Cursor::new(b"secret-bytes"), &mut sealed, 2, 32, &passwords, None)
+            .unwrap();
+        let mut restored = Vec::new();
+        assert!(engine
+            .restore(Cursor::new(sealed.clone()), &mut restored, &split.shares[0..1], &[None])
+            .is_err());
+        let mut wrong = passwords.clone();
+        wrong[1] = Some(Password::new("nope".to_owned()).unwrap());
+        assert!(engine
+            .restore(Cursor::new(sealed.clone()), &mut restored, &split.shares, &wrong)
+            .is_err());
+        engine
+            .restore(
+                Cursor::new(sealed.clone()),
+                &mut restored,
+                &split.shares[1..],
+                &passwords[1..],
+            )
+            .unwrap();
+        assert_eq!(restored, b"secret-bytes");
+        sealed[20] ^= 0xff;
+        restored.clear();
+        assert!(engine
+            .restore(Cursor::new(sealed), &mut restored, &split.shares, &passwords)
+            .is_err());
+    }
+
+    fn split_of(secret: &[u8], threshold: u8, count: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let passwords = vec![None; count];
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(&mut Cursor::new(secret), &mut sealed, threshold, 32, &passwords, None)
+            .unwrap();
+        // Keep the temp dir alive until the split returns; staging files are inside the
+        // sealed buffer.
+        drop(engine);
+        drop(dir);
+        (sealed, split.shares)
+    }
+
+    fn restore_with(sealed: &[u8], shares: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let passwords = vec![None; shares.len()];
+        let mut restored = Vec::new();
+        match engine.restore(Cursor::new(sealed), &mut restored, shares, &passwords) {
+            | Ok(()) => Ok(restored),
+            | Err(err) => Err(err.to_string()),
         }
     }
 
-    fn engine() -> SecretSharingEngine {
-        SecretSharingEngine::new(ArchiveVersion::current())
-    }
-
-    fn secret() -> SecretBytes {
-        SecretBytes::new(SECRET.to_vec())
-    }
-
-    fn paths(dir: &Path) -> PathResolver {
-        PathResolver::with_cwd(dir.to_path_buf())
-    }
-
-    fn spec(path: PathBuf, password: Option<&str>, comment: Option<&str>, include_info: bool) -> ShareSpec {
-        ShareSpec {
-            path,
-            encrypt: password.map(|password| {
-                BlueprintShareEncryption::plain(Password::new(password.to_owned()).expect("test password"))
-            }),
-            comment: comment.map(str::to_owned),
-            include_info,
+    fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        let mut chosen = Vec::new();
+        fn walk(start: usize, n: usize, k: usize, chosen: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+            if chosen.len() == k {
+                out.push(chosen.clone());
+                return;
+            }
+            for index in start..n {
+                chosen.push(index);
+                walk(index + 1, n, k, chosen, out);
+                chosen.pop();
+            }
         }
-    }
-
-    fn blueprint(dir: &Path) -> Blueprint {
-        Blueprint::try_new(
-            2,
-            vec![
-                spec(dir.join("alice.share"), None, None, true),
-                spec(dir.join("bob.share"), None, None, true),
-                spec(
-                    dir.join("charlie.share"),
-                    Some("charlie-password"),
-                    Some("encrypted share"),
-                    true,
-                ),
-            ],
-            &paths(dir),
-        )
-        .expect("test blueprint")
-    }
-
-    fn read_share(path: &Path) -> Result<crate::archive::ShareFile> {
-        Ok(crate::archive::ShareFile::new(path.to_path_buf(), fs::read(path)?))
-    }
-
-    fn restore(engine: &SecretSharingEngine, paths: &[PathBuf], mode: PromptMode) -> Result<SecretBytes> {
-        let shares = paths.iter().map(|path| read_share(path)).collect::<Result<Vec<_>>>()?;
-        engine.restore(&shares, mode, &mut ScriptedPrompt { passwords: Vec::new() })
+        walk(0, n, k, &mut chosen, &mut out);
+        out
     }
 
     #[test]
-    fn restores_generated_plain_shares() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let restored = restore(
-            &engine,
-            &[
-                blueprint.shares()[0].path().to_path_buf(),
-                blueprint.shares()[1].path().to_path_buf(),
-            ],
-            PromptMode::Batch,
-        )?;
-        assert_eq!(restored.as_slice(), SECRET);
-        Ok(())
+    fn every_3_of_5_subset_restores_and_every_pair_fails() {
+        let secret = b"break-glass signing key\0\xff";
+        let (sealed, shares) = split_of(secret, 3, 5);
+        assert_eq!(shares.len(), 5);
+        for subset in combinations(5, 3) {
+            let picked: Vec<_> = subset.into_iter().map(|index| shares[index].clone()).collect();
+            assert_eq!(restore_with(&sealed, &picked).unwrap(), secret);
+        }
+        for subset in combinations(5, 2) {
+            let picked: Vec<_> = subset.into_iter().map(|index| shares[index].clone()).collect();
+            let err = restore_with(&sealed, &picked).unwrap_err();
+            assert!(err.contains("need at least 3"), "{err}");
+        }
+        let mut reversed = shares.clone();
+        reversed.reverse();
+        assert_eq!(restore_with(&sealed, &reversed).unwrap(), secret);
+        let mut too_many = shares.clone();
+        too_many.push(shares[0].clone());
+        let err = restore_with(&sealed, &too_many).unwrap_err();
+        assert!(err.contains("duplicate share") || err.contains("more shares"), "{err}");
     }
 
     #[test]
-    fn generated_shares_default_to_threshold_info() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = Blueprint::from_hocon(
-            br#"
-                threshold = 2
-                generate = [
-                  { path = "alice.share" },
-                  { path = "bob.share" }
-                ]
-            "#,
-            &paths(&dir.0),
-        )?;
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let err = restore(
-            &engine,
-            &[blueprint.shares()[0].path().to_path_buf()],
-            PromptMode::Batch,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("Need at least 2 shares"));
-        Ok(())
+    fn chunk_boundaries_and_binary_secrets_roundtrip() {
+        for size in [0, 1, 64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1, 128 * 1024 + 7] {
+            let secret: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+            roundtrip(&secret, 3, &[None, None, None, None, None]);
+        }
+        roundtrip(&[0u8; 100], 2, &[None, None]);
+        roundtrip(&[0xff; 100], 2, &[None, None]);
+        roundtrip(b"AGRSAGRH", 1, &[None]);
     }
 
     #[test]
-    fn encrypted_share_contains_only_its_shamir_share() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-
-        let alice = Archive::parse(&fs::read(blueprint.shares()[0].path())?)?.archive_data()?;
-        let alice_share = match alice.into_parts().0.into_parts() {
-            | (crate::archive::ShareBody::Plain(data), _) => {
-                ShamirShare::try_from(data.as_slice()).map_err(|err| anyhow::anyhow!(err))?
-            },
-            | _ => unreachable!("alice share is not encrypted"),
-        };
-        let charlie = Archive::parse(&fs::read(blueprint.shares()[2].path())?)?.archive_data()?;
-        let (charlie_share, auth) = match charlie.into_parts().0.into_parts() {
-            | (crate::archive::ShareBody::Encrypted(data), auth) => {
-                let opened = engine
-                    .cipher
-                    .open(data.as_slice(), &Password::new("charlie-password".to_owned())?)?;
-                (
-                    ShamirShare::try_from(opened.as_slice()).map_err(|err| anyhow::anyhow!(err))?,
-                    auth,
-                )
-            },
-            | _ => unreachable!("charlie share is encrypted"),
-        };
-
-        assert_ne!(Vec::<u8>::from(&charlie_share), SECRET);
-        let mut recovered = Sharks(2)
-            .recover([alice_share, charlie_share].iter())
-            .map_err(|err| anyhow::anyhow!(err))?;
-        let payload = SecretBytes::new(std::mem::take(&mut *recovered));
-        assert_eq!(engine.authenticator.open(payload, &auth)?.as_slice(), SECRET);
-        Ok(())
-    }
-
-    #[test]
-    fn authenticated_restore_rejects_tampered_tag() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        tamper_tag(blueprint.shares()[0].path())?;
-        tamper_tag(blueprint.shares()[1].path())?;
-        let shares = vec![
-            read_share(blueprint.shares()[0].path())?,
-            read_share(blueprint.shares()[1].path())?,
+    fn distinct_passwords_and_swapped_bodies_fail_closed() {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let passwords = [
+            Some(Password::new("one".to_owned()).unwrap()),
+            Some(Password::new("two".to_owned()).unwrap()),
+            Some(Password::new("three".to_owned()).unwrap()),
+            None,
+            None,
         ];
-        assert!(engine
-            .restore(&shares, PromptMode::Batch, &mut ScriptedPrompt {
-                passwords: Vec::new()
-            })
-            .is_err());
-        Ok(())
-    }
+        let secret = b"quorum secret";
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(&mut Cursor::new(secret), &mut sealed, 3, 32, &passwords, None)
+            .unwrap();
+        let mut restored = Vec::new();
+        engine
+            .restore(
+                Cursor::new(sealed.clone()),
+                &mut restored,
+                &split.shares[0..3],
+                &passwords[0..3],
+            )
+            .unwrap();
+        assert_eq!(restored, secret);
 
-    fn tamper_tag(path: &Path) -> Result<PathBuf> {
-        let mut archive: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
-        let encoded = archive["data"].as_str().context("missing data")?.to_owned();
-        let mut data: serde_json::Value = serde_json::from_slice(&STANDARD.decode(encoded)?)?;
-        let share = data["share"].as_object_mut().context("missing share")?;
-        let body = if share.contains_key("plain") {
-            share.get_mut("plain")
-        } else {
-            share.get_mut("encrypted")
-        }
-        .context("missing share body")?;
-        body["auth"]["tag"] = serde_json::Value::String(STANDARD.encode([0u8; 64]));
-        archive["data"] = serde_json::Value::String(STANDARD.encode(serde_json::to_vec(&data)?));
-        fs::write(path, serde_json::to_vec(&archive)?)?;
-        Ok(path.to_path_buf())
-    }
-
-    #[test]
-    fn refuses_to_overwrite_existing_share_without_force() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        fs::write(blueprint.shares()[0].path(), b"existing")?;
-        assert!(engine
-            .split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)
-            .is_err());
-        assert_eq!(fs::read(blueprint.shares()[0].path())?, b"existing");
-        Ok(())
-    }
-
-    #[test]
-    fn provider_failure_does_not_write_partial_share_set() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = Blueprint::try_new(
-            2,
-            vec![
-                spec(dir.0.join("alice.share"), None, None, true),
-                spec(dir.0.join("bob.share"), None, None, true),
-                ShareSpec {
-                    path: dir.0.join("charlie.share"),
-                    encrypt: Some(BlueprintShareEncryption::shell("exit 1".to_owned())),
-                    comment: None,
-                    include_info: true,
-                },
-            ],
-            &paths(&dir.0),
-        )?;
-        assert!(engine
-            .split(&secret(), &blueprint, ShellTrust::Trusted, Overwrite::Refuse)
-            .is_err());
-        for share in blueprint.shares() {
-            assert!(!share.path().exists());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn shell_without_trust_writes_nothing() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = Blueprint::try_new(
-            1,
-            vec![ShareSpec {
-                path: dir.0.join("alice.share"),
-                encrypt: Some(BlueprintShareEncryption::shell("printf secret".to_owned())),
-                comment: None,
-                include_info: true,
-            }],
-            &paths(&dir.0),
-        )?;
+        let mut swapped = split.shares.clone();
+        swapped.swap(0, 1);
         let err = engine
-            .split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)
-            .unwrap_err();
-        assert!(err.to_string().contains("--trust"));
-        assert!(!blueprint.shares()[0].path().exists());
-        Ok(())
+            .restore(
+                Cursor::new(sealed.clone()),
+                &mut restored,
+                &swapped[0..3],
+                &passwords[0..3],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("decryption failed") || err.contains("authentication failed"),
+            "{err}"
+        );
+
+        let err = engine
+            .restore(Cursor::new(sealed.clone()), &mut restored, &split.shares[0..3], &[
+                passwords[0].clone(),
+                None,
+                passwords[2].clone(),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("password protected"), "{err}");
+
+        let err = engine
+            .restore(Cursor::new(sealed), &mut restored, &split.shares, &passwords[0..4])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("password count"), "{err}");
     }
 
     #[test]
-    fn encrypted_share_requires_interactive_restore_and_correct_password() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let charlie = Archive::parse(&fs::read(blueprint.shares()[2].path())?)?.archive_data()?;
-        let crate::archive::ShareBody::Encrypted(data) = charlie.into_parts().0.into_parts().0 else {
-            unreachable!("charlie share is encrypted");
-        };
+    fn tampered_unprotected_share_does_not_emit_a_secret() {
+        let (sealed, mut shares) = split_of(b"do-not-emit", 2, 3);
+        let last = shares[0].len() - 1;
+        shares[0][last] ^= 0x5a;
+        let err = restore_with(&sealed, &shares).unwrap_err();
+        assert!(
+            err.contains("authentication failed")
+                || err.contains("does not belong")
+                || err.contains("not an agree share"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn key_size_is_a_multiple_of_32_and_each_layer_is_required() {
+        roundtrip_with_key(b"layered-secret", 2, 64, &[None, None]);
+        let mut large = vec![7u8; 70_000];
+        large[69_999] = 9;
+        roundtrip_with_key(&large, 2, 96, &[None, None, None]);
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let err = engine
+            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 1, 48, &[None], None)
+            .err()
+            .expect("48-byte key must fail")
+            .to_string();
+        assert!(err.contains("multiple of 32"), "{err}");
+        let err = engine
+            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 1, 0, &[None], None)
+            .err()
+            .expect("empty key must fail")
+            .to_string();
+        assert!(err.contains("multiple of 32"), "{err}");
+    }
+
+    fn roundtrip_with_key(secret: &[u8], threshold: u8, key_bytes: u16, passwords: &[Option<Password>]) {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(
+                &mut Cursor::new(secret),
+                &mut sealed,
+                threshold,
+                key_bytes,
+                passwords,
+                None,
+            )
+            .unwrap();
+        assert_eq!(split.key_bytes, key_bytes);
+        let mut restored = Vec::new();
+        engine
+            .restore(Cursor::new(&sealed), &mut restored, &split.shares, passwords)
+            .unwrap();
+        assert_eq!(restored, secret);
+        let mut short = split.shares.clone();
+        // A 32-byte reconstruction cannot open a wider key. Damage the Shamir body
+        // length so the share no longer carries the full key, and restore must
+        // fail closed.
+        let end = short[0].len();
+        short[0][end - 1] ^= 0xff;
         assert!(engine
-            .cipher
-            .open(data.as_slice(), &Password::new("wrong-password".to_owned())?)
+            .restore(Cursor::new(sealed), &mut Vec::new(), &short, passwords)
             .is_err());
-        let err = restore(
-            &engine,
-            &[
-                blueprint.shares()[0].path().to_path_buf(),
-                blueprint.shares()[2].path().to_path_buf(),
-            ],
-            PromptMode::Batch,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("--interactive"));
-
-        let shares = vec![
-            read_share(blueprint.shares()[0].path())?,
-            read_share(blueprint.shares()[2].path())?,
-        ];
-        let restored = engine.restore(&shares, PromptMode::Interactive, &mut ScriptedPrompt {
-            passwords: vec![Password::new("charlie-password".to_owned())?],
-        })?;
-        assert_eq!(restored.as_slice(), SECRET);
-        Ok(())
     }
 
     #[test]
-    fn redacted_info_hides_sensitive_archive_fields() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let archive = Archive::parse(&fs::read(blueprint.shares()[2].path())?)?;
-        let redacted = serde_json::to_string(&archive.archive_data()?.redacted_json())?;
-        let report = archive.report()?.to_string();
-        assert!(redacted.contains("<redacted>"));
-        assert!(report.contains("<redacted>"));
-        assert!(!redacted.contains("charlie-password"));
-        assert!(!report.contains("charlie-password"));
-        assert!(!redacted.contains("argon2id"));
-        Ok(())
+    fn rejects_invalid_schemes_and_foreign_shares() {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let err = engine
+            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 0, 32, &[None], None)
+            .err()
+            .expect("threshold 0 must fail")
+            .to_string();
+        assert!(err.contains("greater than 0"), "{err}");
+        let err = engine
+            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 3, 32, &[None, None], None)
+            .err()
+            .expect("threshold above share count must fail")
+            .to_string();
+        assert!(err.contains("exceeds"), "{err}");
+
+        let (sealed_a, shares_a) = split_of(b"alpha", 2, 2);
+        let (_sealed_b, shares_b) = split_of(b"beta", 2, 2);
+        let mixed = vec![shares_a[0].clone(), shares_b[1].clone()];
+        let err = restore_with(&sealed_a, &mixed).unwrap_err();
+        assert!(err.contains("does not belong"), "{err}");
+        assert!(restore_with(&sealed_a, &[]).unwrap_err().contains("at least one share"));
     }
 
     #[test]
-    fn restore_rejects_unsupported_archive_version() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = blueprint(dir.0.as_path());
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(blueprint.shares()[0].path())?)?;
-        value["version"] = serde_json::json!("9.9");
-        let shares = vec![
-            crate::archive::ShareFile::new(blueprint.shares()[0].path().to_path_buf(), serde_json::to_vec(&value)?),
-            read_share(blueprint.shares()[1].path())?,
-        ];
-        assert!(engine
-            .restore(&shares, PromptMode::Batch, &mut ScriptedPrompt {
-                passwords: Vec::new()
-            })
-            .is_err());
-        Ok(())
-    }
+    fn provided_key_is_the_key_that_is_split() {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let mut raw = vec![0xA5u8; 64];
+        raw[0] = 0x11;
+        raw[63] = 0xee;
+        let secret = b"external-key-secret";
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(
+                &mut Cursor::new(&secret[..]),
+                &mut sealed,
+                2,
+                64,
+                &[None, None],
+                Some(DataKey::from_bytes(raw.clone())),
+            )
+            .unwrap();
+        let bodies = split
+            .shares
+            .iter()
+            .map(|bytes| ShareRecord::decode(bytes).unwrap().body)
+            .collect::<Vec<_>>();
+        let recovered = super::recover(&bodies, 2, 64).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_slice());
+        let mut restored = Vec::new();
+        engine
+            .restore(Cursor::new(&sealed), &mut restored, &split.shares, &[None, None])
+            .unwrap();
+        assert_eq!(restored, secret);
 
-    #[test]
-    fn restores_when_more_shares_than_threshold_are_supplied() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = Blueprint::try_new(
-            2,
-            vec![
-                spec(dir.0.join("alice.share"), None, None, true),
-                spec(dir.0.join("bob.share"), None, None, true),
-                spec(dir.0.join("charlie.share"), None, None, true),
-            ],
-            &paths(&dir.0),
-        )?;
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let restored = restore(
-            &engine,
-            &[
-                blueprint.shares()[0].path().to_path_buf(),
-                blueprint.shares()[1].path().to_path_buf(),
-                blueprint.shares()[2].path().to_path_buf(),
-            ],
-            PromptMode::Batch,
-        )?;
-        assert_eq!(restored.as_slice(), SECRET);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_shares_from_different_splits() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let first = Blueprint::try_new(1, vec![spec(dir.0.join("one.share"), None, None, true)], &paths(&dir.0))?;
-        let second = Blueprint::try_new(1, vec![spec(dir.0.join("two.share"), None, None, true)], &paths(&dir.0))?;
-        engine.split(&secret(), &first, ShellTrust::Denied, Overwrite::Refuse)?;
-        engine.split(&secret(), &second, ShellTrust::Denied, Overwrite::Refuse)?;
-        let err = restore(
-            &engine,
-            &[
-                first.shares()[0].path().to_path_buf(),
-                second.shares()[0].path().to_path_buf(),
-            ],
-            PromptMode::Batch,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("different split"));
-        Ok(())
-    }
-
-    #[test]
-    fn edit_replaces_password_and_still_restores() -> Result<()> {
-        let dir = TempDir::new()?;
-        let engine = engine();
-        let blueprint = Blueprint::try_new(
-            2,
-            vec![
-                spec(dir.0.join("alice.share"), None, None, true),
-                spec(dir.0.join("bob.share"), Some("old-password"), None, true),
-            ],
-            &paths(&dir.0),
-        )?;
-        engine.split(&secret(), &blueprint, ShellTrust::Denied, Overwrite::Refuse)?;
-        let bob = read_share(blueprint.shares()[1].path())?;
-        engine.edit(
-            &bob,
-            Some(Password::new("new-password".to_owned())?),
-            &mut ScriptedPrompt {
-                passwords: vec![Password::new("old-password".to_owned())?],
-            },
-        )?;
-        let edited = Archive::parse(&fs::read(blueprint.shares()[1].path())?)?.archive_data()?;
-        let crate::archive::ShareBody::Encrypted(data) = edited.into_parts().0.into_parts().0 else {
-            unreachable!("edited share stays encrypted");
-        };
-        assert!(engine
-            .cipher
-            .open(data.as_slice(), &Password::new("old-password".to_owned())?)
-            .is_err());
-        let shares = vec![
-            read_share(blueprint.shares()[0].path())?,
-            read_share(blueprint.shares()[1].path())?,
-        ];
-        let restored = engine.restore(&shares, PromptMode::Interactive, &mut ScriptedPrompt {
-            passwords: vec![Password::new("new-password".to_owned())?],
-        })?;
-        assert_eq!(restored.as_slice(), SECRET);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_share_index_zero() {
-        assert!(super::share_index(&[0, 1]).is_err());
-        assert_eq!(super::share_index(&[1, 2]).unwrap(), 1);
+        let mut empty = Vec::new();
+        let err = engine
+            .split(
+                &mut Cursor::new(b"x"),
+                &mut empty,
+                1,
+                64,
+                &[None],
+                Some(DataKey::from_bytes(vec![1; 32])),
+            )
+            .err()
+            .expect("a short provided key must fail")
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert!(empty.is_empty(), "a rejected key must not start a sealed file");
     }
 }

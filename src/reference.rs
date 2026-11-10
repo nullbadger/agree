@@ -1,5 +1,5 @@
 use {
-    crate::args::ClapArgumentLoader,
+    crate::args::Cli,
     anyhow::{
         Context,
         Result,
@@ -13,8 +13,7 @@ use {
     },
 };
 
-/// Generates manpages, markdown docs, and shell completions from the CLI
-/// definition.
+/// Generates manpages, markdown docs, and shell completions from the CLI.
 pub(crate) struct ReferenceBuilder;
 
 impl ReferenceBuilder {
@@ -23,7 +22,7 @@ impl ReferenceBuilder {
     }
 
     pub(crate) fn build_shell_completion(&self, outdir: &Path, shell: &Shell) -> Result<()> {
-        let mut app = ClapArgumentLoader::root_command();
+        let mut app = Cli::root_command();
         clap_complete::generate_to(*shell, &mut app, env!("CARGO_PKG_NAME"), outdir)
             .with_context(|| format!("Failed to write shell completion in {}", outdir.display()))?;
         Ok(())
@@ -59,7 +58,7 @@ impl ReferenceBuilder {
                 walk(&new_path, commands, subcommand);
             }
         }
-        walk("", &mut commands, &ClapArgumentLoader::root_command());
+        walk("", &mut commands, &Cli::root_command());
         commands
     }
 }

@@ -1,21 +1,29 @@
-/// Stable failures callers match, display, or test.
-///
-/// Contextual IO and validation failures use `anyhow` at the call site.
-/// Variants here are the ones with a fixed recovery action or a security
-/// meaning.
+/// Failures a caller can match or print without seeing secret material.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
-    #[error("{command} is experimental; re-run with --experimental")]
-    Experimental { command: &'static str },
+    #[error("need at least {need} shares to restore this secret; received {got}")]
+    NeedShares { need: u8, got: usize },
 
-    #[error("blueprint contains a shell password provider; re-run with --trust to allow it")]
-    ShellNotTrusted,
+    #[error("secret authentication failed")]
+    AuthenticationFailed,
 
-    #[error("share is encrypted; re-run with --interactive to enter the password")]
+    #[error("decryption failed")]
+    DecryptionFailed,
+
+    #[error("failed to encrypt")]
+    EncryptionFailed,
+
+    #[error("format version {found} is not this agree; this binary only reads version {expected}")]
+    UnsupportedVersion { found: u8, expected: u8 },
+
+    #[error("share does not belong to this sealed secret")]
+    WrongGroup,
+
+    #[error("duplicate share")]
+    DuplicateShare,
+
+    #[error("share is password protected")]
     PasswordRequired,
-
-    #[error("passwords do not match")]
-    PasswordMismatch,
 
     #[error("share password must not be empty")]
     EmptyPassword,
@@ -23,24 +31,22 @@ pub(crate) enum Error {
     #[error("share password exceeds {max} bytes")]
     PasswordTooLong { max: usize },
 
-    #[error("decryption failed")]
-    DecryptionFailed,
+    #[error("YubiKey PIN must be 1 to 8 bytes")]
+    InvalidPin,
 
-    #[error("failed to encrypt share")]
-    EncryptionFailed,
+    #[error(
+        "YubiKey PIV objects hold at most {max} bytes; this payload is {len} bytes. Put shares on the YubiKey and the \
+         sealed secret on a file or device:"
+    )]
+    YubiKeyTooLarge { len: usize, max: usize },
 
-    #[error("secret authentication failed")]
-    AuthenticationFailed,
+    #[cfg(feature = "yubikey")]
+    #[error("refusing to overwrite a reserved YubiKey object {object:06x} without --force")]
+    ReservedObject { object: u32 },
 
-    #[error("duplicate share: {path}")]
-    DuplicateShare { path: String },
+    #[error("writing to a device requires --force")]
+    DeviceNeedsForce,
 
-    #[error("invalid archive identifier")]
-    InvalidIdentifier,
-
-    #[error("invalid archive version")]
-    InvalidVersion,
-
-    #[error("invalid share archive: {0}")]
-    InvalidArchive(String),
+    #[error("refusing to write secret bytes to a terminal")]
+    TerminalOutput,
 }
