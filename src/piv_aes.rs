@@ -6,9 +6,10 @@
 
 use {
     aes::cipher::{
-        generic_array::GenericArray,
-        BlockDecrypt,
-        BlockEncrypt,
+        Block,
+        BlockCipherDecrypt,
+        BlockCipherEncrypt,
+        Key,
         KeyInit,
     },
     anyhow::{
@@ -274,15 +275,15 @@ fn response_bytes(response: &[u8]) -> Result<[u8; 16]> {
 }
 
 fn decrypt_block(key: &[u8; 24], block: &[u8]) -> [u8; 16] {
-    let cipher = aes::Aes192::new(GenericArray::from_slice(key));
-    let mut output = GenericArray::clone_from_slice(block);
+    let cipher = aes::Aes192::new(&Key::<aes::Aes192>::from(*key));
+    let mut output = Block::<aes::Aes192>::try_from(block).expect("AES block is 16 bytes");
     cipher.decrypt_block(&mut output);
     output.into()
 }
 
 fn encrypt_block(key: &[u8; 24], block: &[u8]) -> [u8; 16] {
-    let cipher = aes::Aes192::new(GenericArray::from_slice(key));
-    let mut output = GenericArray::clone_from_slice(block);
+    let cipher = aes::Aes192::new(&Key::<aes::Aes192>::from(*key));
+    let mut output = Block::<aes::Aes192>::try_from(block).expect("AES block is 16 bytes");
     cipher.encrypt_block(&mut output);
     output.into()
 }

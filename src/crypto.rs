@@ -119,10 +119,10 @@ impl SecretCipher {
         let mut current = plaintext.to_vec();
         for (layer, key) in self.key.as_bytes().chunks(KEY_LEN).enumerate() {
             let cipher = XChaCha20Poly1305::new_from_slice(key).context("invalid data key")?;
-            let nonce = self.nonce(counter);
+            let nonce = XNonce::from(self.nonce(counter));
             let aad = self.aad(counter, last, u8::try_from(layer).expect("layer fits in u8"));
             current = cipher
-                .encrypt(XNonce::from_slice(&nonce), Payload {
+                .encrypt(&nonce, Payload {
                     msg: &current,
                     aad: &aad,
                 })
@@ -136,10 +136,10 @@ impl SecretCipher {
         let mut current = ciphertext.to_vec();
         for (layer, key) in layers.iter().enumerate().rev() {
             let cipher = XChaCha20Poly1305::new_from_slice(key).context("invalid data key")?;
-            let nonce = self.nonce(counter);
+            let nonce = XNonce::from(self.nonce(counter));
             let aad = self.aad(counter, last, u8::try_from(layer).expect("layer fits in u8"));
             current = cipher
-                .decrypt(XNonce::from_slice(&nonce), Payload {
+                .decrypt(&nonce, Payload {
                     msg: &current,
                     aad: &aad,
                 })
@@ -237,11 +237,9 @@ impl ShareCipher {
         OsRng.fill_bytes(&mut nonce);
         self.derive(password, &salt, &mut key)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key).context("invalid share key")?;
+        let nonce = chacha20poly1305::Nonce::try_from(nonce.as_slice()).expect("nonce is 12 bytes");
         let encrypted = cipher
-            .encrypt(chacha20poly1305::Nonce::from_slice(&nonce), Payload {
-                msg: plaintext,
-                aad,
-            })
+            .encrypt(&nonce, Payload { msg: plaintext, aad })
             .map_err(|_| Error::EncryptionFailed)?;
         key.zeroize();
         let mut out = Vec::with_capacity(salt.len() + nonce.len() + encrypted.len());
@@ -261,11 +259,9 @@ impl ShareCipher {
         let mut key = [0u8; KEY_LEN];
         self.derive(password, salt, &mut key)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key).context("invalid share key")?;
+        let nonce = chacha20poly1305::Nonce::try_from(nonce).expect("nonce is 12 bytes");
         let opened = cipher
-            .decrypt(chacha20poly1305::Nonce::from_slice(nonce), Payload {
-                msg: ciphertext,
-                aad,
-            })
+            .decrypt(&nonce, Payload { msg: ciphertext, aad })
             .map_err(|_| Error::DecryptionFailed);
         key.zeroize();
         opened.map_err(Into::into)

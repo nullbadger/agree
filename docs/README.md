@@ -12,7 +12,7 @@ Five people, threshold 3, means any three of them can reconstruct the secret. It
 
 Optional per-share passwords, and writing a share onto a YubiKey, are how a share stays bound to a holder. The threshold is still the Shamir threshold. Passwords and hardware do not add a second approval system. They raise the cost of stealing a share.
 
-The machine that runs `split` sees the whole secret. Two people should watch that ceremony, on a machine that is not the everyday laptop, and the dealer media should be destroyed afterwards. `agree` cannot make a trusted dealer unnecessary. For a one-time break-glass split, that is acceptable if it happens once and the secret does not stay online.
+The machine that runs `split` sees the whole secret. Two people should watch that ceremony, on a machine that is not the everyday laptop. Afterwards, overwrite the secret file if the disk is magnetic and has no snapshots. On an SSD or APFS, that overwrite misses the old pages, so the control is full-disk encryption and powering off, not shredding and not destroying the disk. A snapshot that ran while the secret existed has to be deleted. `agree` cannot make a trusted dealer unnecessary. For a one-time break-glass split, that is acceptable if it happens once and the secret does not stay online.
 
 A restore also reconstructs the secret in the process that runs `agree restore`. That process is trusted for that hour. Hardware does not remove the combining step.
 
@@ -187,45 +187,15 @@ Do not put passwords on the command line. They would show up in the process list
 
 ## Break-glass ceremony
 
-This is the procedure the tool is shaped around. The commands enforce the mechanical parts. The watching, the storage separation, and the wipe are still on you.
+The procedure is `docs/CEREMONY.md`. Follow that checklist to the letter. Do not improvise a shorter one from this page.
 
-**Before.** Name five custodians in different places. Agree the threshold is 3. Each custodian who will use a YubiKey brings one, with a PIN that is not the factory `123456`, and a management key that is not the factory key. Authenticate object ids out of band so nobody writes a share onto a certificate slot. Decide where the sealed secret will live. It should be reachable on the day three people must open the data, and it should exist in more than one copy.
+The commands enforce the mechanical parts. The watching, the storage separation, and the wipe are still on you. Name five custodians in different places. The threshold is 3. Each custodian who will use a YubiKey brings one, with a PIN that is not the factory `123456`, and a management key that is not the factory key. Authenticate object ids out of band so nobody writes a share onto a certificate slot. The sealed secret must be reachable on the day three people must open the data, and it must exist in more than one copy.
 
-**Deal.** On the air-gapped machine, confirm the signing key actually opens the data. Then:
+Deal, store, and open are in `docs/CEREMONY.md`. Do not substitute the command summary below for that checklist. A file share is acceptable only if the file and the means to read it leave with one custodian. A YubiKey share is the token that person carries. The stderr summary prints the share count, the threshold, the key size, the group id, and the sealed path. It does not print the secret or the data key. Do not pass `--key-file`. A remaining copy of that key opens the sealed secret without a quorum.
 
-```bash
-agree split \
-  --threshold 3 \
-  --sealed sealed.bin \
-  --share alice.share \
-  --share bob.share \
-  --share yubikey:12345678/5fff21 \
-  --share dave.share \
-  --share yubikey:87654321/5fff21 \
-  --protect \
-  < signing-key.pem
-```
+No three shares in one site. No custodian holds two. The sealed secret is stored with the encrypted data and in a second location. Labels carry the group id and the custodian, not the secret. A successor does not receive a forwarded share. Succession is a new split after a restore, or a planned rotation while three current custodians are still available.
 
-That example mixes files and two YubiKeys. The dealer is prompted to insert each key, then to enter that key's PIN and, unless `--management-key` was passed, that key's management key. Stdin is read only after those keys have accepted their credentials. A file share is fine if the file and the means to read it are separated. A YubiKey share is fine if the token is the thing the person carries. Read the stderr summary. It prints the share count, the threshold, the key size, the group id, and the sealed path. It does not print the secret or the data key. The data key is drawn by the operating system unless `--key-file` supplies it. If you supply it, destroy that source after the test restore. A remaining copy opens the sealed secret without a quorum.
-
-Each custodian should confirm they can read their own share header, and that the group id matches what the dealer printed. They cannot check the Shamir math without two other shares. A test restore on the dealer machine, before the secret is destroyed, is the check that the set actually opens. That test restore reveals the secret to the dealer machine again, which already had it. Wipe it before the machine leaves the room.
-
-**Store.** No three shares in one site. No custodian holds two. The sealed secret is stored with the encrypted data and in a second location. Envelopes and tokens are labeled with the group id and the custodian, not with the secret. A successor does not receive a forwarded share. Succession is a new split after a restore, or a planned rotation while three current custodians are still available.
-
-**Open.**
-
-```bash
-agree restore \
-  --sealed sealed.bin \
-  --share alice.share \
-  --share dave.share \
-  --share yubikey:87654321/5fff21 \
-  > signing-key.pem
-```
-
-Any other trio works. Write down why the secret was restored, which data was opened, and which three shares were used. Copy out only what the incident needs. Then remove `signing-key.pem` and wipe the ceremony machine. Do not put the restored key in a password manager, a ticket, or iCloud.
-
-If that machine was untrusted, or the key was copied, rotate. New key, re-encrypt the data, new split, destroy the old sealed secret after the new one has been verified. Until that re-encryption, the old shares are still live.
+If the restore machine was untrusted, or the key was copied, rotate. New key, re-encrypt the data, new split, destroy the old sealed secret after the new one has been verified. Until that re-encryption, the old shares are still live.
 
 ## Commands
 
@@ -271,7 +241,7 @@ The tool is fail-closed on the secret. These cases do not write a restored secre
 | Fewer shares than the threshold | Error before decryption. Stdout stays empty. |
 | Duplicate share index, or the same path twice | Rejected. |
 | Shares from different splits, or a sealed file whose commitment does not match | Rejected. |
-| Wrong share password, or a damaged share body | Decryption or authentication failure. No alternate secret. |
+| Wrong share password, a damaged share, or a sealed chunk that fails authentication | Decryption or authentication failure. Stdout stays empty, including when an earlier chunk would have opened. |
 | Truncated sealed secret, a format version this binary does not write, unknown share flags | Rejected. There is no old-version reader. |
 | Threshold larger than the number of `--share` arguments, or threshold 0 | Rejected. |
 | `--key-bytes` not a multiple of 32, or outside 32 to 1024 | Rejected before the key file is opened and before any share is written. |
@@ -301,9 +271,9 @@ It will not prove a share is consistent without a test restore. There is no Feld
 
 It will not fit an arbitrary sealed secret on a YubiKey. The 3063-byte object limit is a property of the card, not a setting.
 
-It will not securely erase a disk, a terminal scrollback buffer, or an SSD page. Unlink is not a wipe. The dealer checklist ends with destroying the media you can destroy, not with a promise about wear leveling.
+It will not securely erase a disk, a terminal scrollback buffer, or an SSD page. Unlink is not a wipe. Overwriting a file does not hit the old pages on an SSD or on APFS. The checklist does not pretend that it does.
 
-It has not had a third-party cryptographic audit. The tests cover the quorum matrix, tampered inputs, passwords, device framing, and the YubiKey checks that can be made without a card. That is an engineering bar, not an audit. The on-wire format belongs to this tool version.
+It has not had a third-party cryptographic audit. The tests cover the quorum matrix, tampered inputs, passwords, device framing, and the YubiKey checks that can be made without a card. That is an engineering bar, not an audit. The on-wire format belongs to this tool version. Residual risks and accepted ceremony limits are in `THREAT_MODEL.md`.
 
 ## Build
 

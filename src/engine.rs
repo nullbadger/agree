@@ -39,8 +39,12 @@ use {
         Sharks,
     },
     std::{
-        fs::File,
+        fs::{
+            self,
+            File,
+        },
         io::{
+            self,
             Read,
             Write,
         },
@@ -154,7 +158,8 @@ impl Engine {
         {
             return Err(Error::WrongGroup.into());
         }
-        let key = recover(&opened, threshold, usize::from(records[0].key_bytes))?;
+        let key_len = validate_key_bytes(records[0].key_bytes)?;
+        let key = recover(&opened, threshold, key_len)?;
         let cipher = SecretCipher::open(
             key,
             staged.header.nonce_prefix,
@@ -336,7 +341,29 @@ fn decode_shares(encoded: &[Vec<u8>]) -> Result<Vec<ShareRecord>> {
 }
 
 fn decrypt_staged<W: Write>(cipher: &SecretCipher, staged: &StagedSealed, output: &mut W) -> Result<()> {
-    let mut file = File::open(&staged.path).context("Failed to read staged sealed secret")?;
+    // Authenticate every chunk before any plaintext reaches the caller. A later
+    // failure must not leave a prefix on stdout.
+    let plain_path = staged.path.with_extension("plain");
+    let _cleanup = RemoveOnDrop(plain_path.clone());
+    let mut plain = create_private_file(&plain_path)?;
+    decrypt_into(cipher, &staged.path, &mut plain)?;
+    plain.sync_all().ok();
+    drop(plain);
+    let mut input = File::open(&plain_path).context("Failed to read restored secret")?;
+    io::copy(&mut input, output).context("Failed to write restored secret")?;
+    Ok(())
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn decrypt_into(cipher: &SecretCipher, staged: &PathBuf, plain: &mut File) -> Result<()> {
+    let mut file = File::open(staged).context("Failed to read staged sealed secret")?;
     let mut counter = 0u32;
     let mut saw_last = false;
     loop {
@@ -347,9 +374,7 @@ fn decrypt_staged<W: Write>(cipher: &SecretCipher, staged: &StagedSealed, output
             bail!("staged sealed secret is corrupt");
         }
         let mut plaintext = cipher.decrypt_chunk(counter, last, &ciphertext)?;
-        output
-            .write_all(&plaintext)
-            .context("Failed to write restored secret")?;
+        plain.write_all(&plaintext).context("Failed to write restored secret")?;
         plaintext.zeroize();
         saw_last = last;
         if last {
@@ -776,5 +801,31 @@ mod tests {
             .to_string();
         assert!(err.contains("does not match"), "{err}");
         assert!(empty.is_empty(), "a rejected key must not start a sealed file");
+    }
+
+    #[test]
+    fn authentication_failure_does_not_emit_a_prefix() {
+        let dir = TempDir::new();
+        let cipher = crate::crypto::SecretCipher::generate([1u8; 16], 1, 1, 32);
+        let path = dir.0.join("staged");
+        let mut file = crate::store::create_private_file(&path).unwrap();
+        let first = cipher.encrypt_chunk(0, false, b"prefix-secret").unwrap();
+        super::write_frame(&mut file, false, &first).unwrap();
+        super::write_frame(&mut file, true, &[0u8; 32]).unwrap();
+        drop(file);
+        let staged = super::StagedSealed {
+            path,
+            header: crate::format::SealedHeader {
+                threshold: 1,
+                count: 1,
+                key_bytes: 32,
+                group: [1u8; 16],
+                nonce_prefix: *cipher.nonce_prefix(),
+            },
+            commitment: [0u8; 32],
+        };
+        let mut out = Vec::new();
+        assert!(super::decrypt_staged(&cipher, &staged, &mut out).is_err());
+        assert!(out.is_empty());
     }
 }
