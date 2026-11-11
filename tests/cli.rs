@@ -666,7 +666,7 @@ fn devices_lists_attached_yubikeys_without_a_pin() {
     assert_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.is_empty() {
-        assert!(stderr(&output).contains("no YubiKey"), "{}", stderr(&output));
+        assert!(stderr(&output).contains("no devices detected"), "{}", stderr(&output));
     } else {
         for line in stdout.lines() {
             assert!(line.starts_with("yubikey:"), "{line}");
@@ -677,7 +677,7 @@ fn devices_lists_attached_yubikeys_without_a_pin() {
     let help = run_in(&dir.0, &["devices", "--help"], b"");
     assert_ok(&help);
     let text = String::from_utf8_lossy(&help.stdout);
-    assert!(text.contains("YubiKey"));
+    assert!(text.contains("hardware"));
 }
 
 #[test]

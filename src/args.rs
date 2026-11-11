@@ -36,7 +36,7 @@ pub(crate) enum Command {
     Split(SplitArgs),
     /// Restore a secret to stdout from a sealed file and a threshold of shares.
     Restore(RestoreArgs),
-    /// List attached YubiKeys this build can open.
+    /// List attached hardware this build can open. Nothing is written.
     Devices,
     /// Render the manual.
     Man(ManArgs),

@@ -167,7 +167,7 @@ Writing requires the PIV PIN and the management key. Split can write each share 
 
 `--management-key` is 48 hex characters (24 bytes) and applies to every token in the command. Firmware 5.7 and later authenticates that value as AES-192. Older keys authenticate it as 3DES. `agree` reads the algorithm from the card. Use it only when every key shares that management key. It shows up in the process list. The prompt is how two keys get two management keys. Change the factory key, and record the new one somewhere that is not the same envelope as the share, before this is a production ceremony. A factory management key means anyone with the PIN and physical access can overwrite objects.
 
-`agree devices` prints one line per attached YubiKey this build can open. No PIN is required, and nothing is written. The number after `yubikey:` is the serial. A reader that is not a YubiKey is skipped. An empty list is not an error. A build without the `yubikey` feature rejects the command. `device:` paths are not listed; those are nodes you already have.
+`agree devices` prints one line per attached device this build can open. No PIN is required, and nothing is written. A YubiKey line starts with `yubikey:` and the number after it is the serial. A reader that is not a YubiKey is skipped by that source. An empty list is not an error. A build without the `yubikey` feature omits that kind and still runs the command. `device:` paths are not listed; those are nodes you already have. A new kind is another source in the same list, not a second command.
 
 Omit the serial (`yubikey:5fff21`) only when one key is attached. If more than one is attached, the command stops and lists the serials instead of guessing. Name the serial when you will swap tokens. Run `agree devices` with one key inserted at a time if you need to see which serial is which.
 
@@ -260,7 +260,7 @@ Passwords, the YubiKey PIN, and a per-key management key for `split` are prompte
 
 Relative paths are resolved from the working directory. `~/` is resolved from `HOME`.
 
-A successful split prints a summary on stderr. Restore writes nothing but the secret to stdout. `agree devices` writes one `yubikey:SERIAL` line per attached key to stdout, or nothing if none are attached. Status and errors stay on stderr.
+A successful split prints a summary on stderr. Restore writes nothing but the secret to stdout. `agree devices` writes one line per attached device to stdout, or nothing if none are attached. A YubiKey line is `yubikey:SERIAL`. Status and errors stay on stderr.
 
 ## Failure behavior
 

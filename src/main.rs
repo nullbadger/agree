@@ -2,6 +2,7 @@
 
 mod args;
 mod crypto;
+mod devices;
 mod engine;
 mod error;
 mod format;
@@ -120,13 +121,13 @@ fn render_completion(args: AutocompleteArgs) -> Result<()> {
 }
 
 fn devices() -> Result<()> {
-    let found = crate::hardware::list_attached()?;
+    let found = crate::devices::list()?;
     if found.is_empty() {
-        eprintln!("no YubiKeys detected");
+        eprintln!("no devices detected");
         return Ok(());
     }
-    for key in found {
-        println!("yubikey:{}  version {}  reader {}", key.serial, key.version, key.reader);
+    for device in found {
+        println!("{device}");
     }
     Ok(())
 }
