@@ -116,13 +116,13 @@ No HTTPS, webhooks, queues, or admin API.
 | TB3 Process ↔ device node | raw bytes | `--force` required, refuse a terminal | Fail closed without `--force`. No rollback after a partial write. |
 | TB4 Process ↔ YubiKey | PIV object, PIN, management key | PIN to read, management key to write, object id allow-list | Fail closed on auth. A successful write cannot be unwritten. |
 | TB5 Fewer than `t` shares ↔ secret | nothing, if Shamir and AEAD hold | threshold check, then Poly1305 | Fail closed. Stdout untouched. |
-| TB6 This binary ↔ another `agree` | files | format version byte | Fail closed. No old reader. |
+| TB6 This binary ↔ another `agree` | files | format revision byte | Fail closed. No old reader. |
 
 Internet ↔ edge, tenant ↔ tenant, IdP, CI ↔ prod, and CSP management plane: N/A. No such boundary exists.
 
 ### 1.8 Architecture overview
 
-One binary. `main` parses arguments and prompts. `engine` streams the secret, splits the key, and restores. `crypto` does layered XChaCha20-Poly1305 and Argon2id share wrap. `format` is version 2. `store` publishes files by rename. `hardware` talks PC/SC. `devices` lists kinds. The default build links PC/SC. `--no-default-features` rejects `yubikey:` locations.
+One binary. `main` parses arguments and prompts. `engine` streams the secret, splits the key, and restores. `crypto` does layered XChaCha20-Poly1305 and Argon2id share wrap. `format` revision is 2. `store` publishes files by rename. `hardware` talks PC/SC. `devices` lists kinds. The default build links PC/SC. `--no-default-features` rejects `yubikey:` locations.
 
 ### 1.9 Data flow diagrams
 
@@ -195,7 +195,7 @@ No user accounts. Access to a share is possession. A password is a local wrap, n
 - `--key-file` is not executed and is not a `device:` or `yubikey:` location.
 - Key length is a multiple of 32, from 32 to 1024, checked again on restore.
 - File outputs are created `0600` and published by rename.
-- Format version 2 is the only version this binary reads.
+- Format revision 2 is the only revision this binary reads.
 
 ### 1.15 Assumptions
 
@@ -558,7 +558,7 @@ ID: M-003
 Threats: T-003, T-007
 Type: prevent
 Description: Keep shamirs pinned at 0.7.0. Do not describe the tests as an audit. A public release states that limit in the README and here.
-Design invariant: format version is bound to this binary
+Design invariant: format revision is bound to this binary
 Verification: Cargo.toml pin; README audit paragraph
 Owner: Alexander Weber
 Effort: S
@@ -767,7 +767,7 @@ The leverage is already in the design: small shares, commitment, AEAD, no genera
 
 ### 5.4 Next review triggers
 
-A new destination kind, a format version change, a `shamirs` bump, a YubiKey write-path change, or a ceremony incident. Otherwise review by 2027-11-10.
+A new destination kind, a format revision change, a `shamirs` bump, a YubiKey write-path change, or a ceremony incident. Otherwise review by 2027-11-10.
 
 ## 6. Quality gate results
 

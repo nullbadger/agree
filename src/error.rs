@@ -13,8 +13,8 @@ pub(crate) enum Error {
     #[error("failed to encrypt")]
     EncryptionFailed,
 
-    #[error("format version {found} is not this agree; this binary only reads version {expected}")]
-    UnsupportedVersion { found: u8, expected: u8 },
+    #[error("format revision {found} is not this agree; this binary only reads revision {expected}")]
+    UnsupportedRevision { found: u8, expected: u8 },
 
     #[error("share does not belong to this sealed secret")]
     WrongGroup,

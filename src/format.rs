@@ -1,14 +1,14 @@
-//! On-wire format for this tool version. The version byte is a fail-closed
-//! check, not a compatibility promise. There is no reader for any other
-//! version, and none should be added just to open old files.
+//! On-wire format for this tool. The revision byte is a fail-closed check,
+//! not a compatibility promise. There is no reader for any other revision,
+//! and none should be added just to open old files.
 //!
 //! Sealed file (`AGRS`):
-//! `magic || version || threshold || count || key_bytes:u16be || group[16] ||
+//! `magic || revision || threshold || count || key_bytes:u16be || group[16] ||
 //! nonce_prefix[20]` then chunks of `last:u8 || ciphertext_len:u32be ||
 //! ciphertext` until `last = 1`.
 //!
 //! Share (`AGRH`):
-//! `magic || version || index || threshold || count || key_bytes:u16be ||
+//! `magic || revision || index || threshold || count || key_bytes:u16be ||
 //! group[16] || commitment[32] || flags || body_len:u32be || body`.
 //! `flags` bit 0 means the body is a password-sealed Shamir share. Otherwise
 //! the body is the Shamir share itself (`x || y[key_bytes]`).
@@ -20,7 +20,7 @@ use {
     std::io::{Read, Write},
 };
 
-pub(crate) const FORMAT_VERSION: u8 = 2;
+pub(crate) const FORMAT_REVISION: u8 = 2;
 pub(crate) const SEALED_MAGIC: &[u8; 4] = b"AGRS";
 pub(crate) const SHARE_MAGIC: &[u8; 4] = b"AGRH";
 pub(crate) const HEADER_LEN: usize = 4 + 1 + 1 + 1 + 2 + 16 + 20;
@@ -42,7 +42,7 @@ pub(crate) struct SealedHeader {
 impl SealedHeader {
     pub(crate) fn write_to<W: Write>(&self, mut out: W) -> Result<()> {
         out.write_all(SEALED_MAGIC)?;
-        out.write_all(&[FORMAT_VERSION, self.threshold, self.count])?;
+        out.write_all(&[FORMAT_REVISION, self.threshold, self.count])?;
         out.write_all(&self.key_bytes.to_be_bytes())?;
         out.write_all(&self.group)?;
         out.write_all(&self.nonce_prefix)?;
@@ -60,10 +60,10 @@ impl SealedHeader {
         if bytes.len() != HEADER_LEN || &bytes[0..4] != SEALED_MAGIC {
             bail!("not an agree sealed secret");
         }
-        if bytes[4] != FORMAT_VERSION {
-            return Err(Error::UnsupportedVersion {
+        if bytes[4] != FORMAT_REVISION {
+            return Err(Error::UnsupportedRevision {
                 found: bytes[4],
-                expected: FORMAT_VERSION,
+                expected: FORMAT_REVISION,
             }
             .into());
         }
@@ -106,7 +106,7 @@ impl ShareRecord {
         let len = u32::try_from(self.body.len()).context("share body is too large")?;
         let mut out = Vec::with_capacity(SHARE_HEADER_LEN + self.body.len());
         out.extend_from_slice(SHARE_MAGIC);
-        out.push(FORMAT_VERSION);
+        out.push(FORMAT_REVISION);
         out.push(self.index);
         out.push(self.threshold);
         out.push(self.count);
@@ -123,10 +123,10 @@ impl ShareRecord {
         if bytes.len() < SHARE_HEADER_LEN || &bytes[0..4] != SHARE_MAGIC {
             bail!("not an agree share");
         }
-        if bytes[4] != FORMAT_VERSION {
-            return Err(Error::UnsupportedVersion {
+        if bytes[4] != FORMAT_REVISION {
+            return Err(Error::UnsupportedRevision {
                 found: bytes[4],
-                expected: FORMAT_VERSION,
+                expected: FORMAT_REVISION,
             }
             .into());
         }
@@ -276,7 +276,7 @@ pub(crate) fn commitment_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SealedHeader, ShareRecord, FORMAT_VERSION};
+    use super::{SealedHeader, ShareRecord, FORMAT_REVISION};
 
     #[test]
     fn share_roundtrip_rejects_trailing_bytes() {
@@ -298,7 +298,7 @@ mod tests {
         let mut extra = encoded.clone();
         extra.push(0);
         assert!(ShareRecord::decode(&extra).is_err());
-        assert_eq!(FORMAT_VERSION, 2);
+        assert_eq!(FORMAT_REVISION, 2);
     }
 
     #[test]
@@ -333,7 +333,7 @@ mod tests {
         let err = ShareRecord::decode(&encoded).unwrap_err().to_string();
         assert!(err.contains("not this agree"), "{err}");
 
-        encoded[4] = FORMAT_VERSION;
+        encoded[4] = FORMAT_REVISION;
         encoded[58] = 0x02;
         assert!(ShareRecord::decode(&encoded)
             .unwrap_err()

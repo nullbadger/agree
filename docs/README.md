@@ -102,14 +102,14 @@ Argon2id at these parameters is an interactive setting. It is not a substitute f
 
 ## On-wire format
 
-The version byte is `2` for this tool. It is not a stable protocol that a later `agree` promises to read. A different binary may refuse these files. Keep the `agree` that created the shares next to the sealed secret. There is no migration path.
+The revision byte is `2` for this tool. It is not a stable protocol that a later `agree` promises to read. A different binary may refuse these files. Keep the `agree` that created the shares next to the sealed secret. There is no migration path.
 
 Sealed secret, magic `AGRS`:
 
 ```text
 offset  size  field
 0       4     magic "AGRS"
-4       1     version = 2
+4       1     revision = 2
 5       1     threshold
 6       1     share count
 7       2     key size in bytes, big-endian, a multiple of 32
@@ -128,7 +128,7 @@ Share, magic `AGRH`:
 ```text
 offset  size  field
 0       4     magic "AGRH"
-4       1     version = 2
+4       1     revision = 2
 5       1     index, 1..=255, never 0
 6       1     threshold
 7       1     share count
@@ -242,7 +242,7 @@ The tool is fail-closed on the secret. These cases do not write a restored secre
 | Duplicate share index, or the same path twice | Rejected. |
 | Shares from different splits, or a sealed file whose commitment does not match | Rejected. |
 | Wrong share password, a damaged share, or a sealed chunk that fails authentication | Decryption or authentication failure. Stdout stays empty, including when an earlier chunk would have opened. |
-| Truncated sealed secret, a format version this binary does not write, unknown share flags | Rejected. There is no old-version reader. |
+| Truncated sealed secret, a format revision this binary does not write, unknown share flags | Rejected. There is no reader for any other revision. |
 | Threshold larger than the number of `--share` arguments, or threshold 0 | Rejected. |
 | `--key-bytes` not a multiple of 32, or outside 32 to 1024 | Rejected before the key file is opened and before any share is written. |
 | `mlock` fails | `split` and `restore` exit before prompts and before the secret is read. No share is written. |
@@ -274,7 +274,7 @@ It will not fit an arbitrary sealed secret on a YubiKey. The 3063-byte object li
 
 It will not securely erase a disk, a terminal scrollback buffer, or an SSD page. Unlink is not a wipe. Overwriting a file does not hit the old pages on an SSD or on APFS. The checklist does not pretend that it does.
 
-It has not had a third-party cryptographic audit. The tests cover the quorum matrix, tampered inputs, passwords, device framing, and the YubiKey checks that can be made without a card. That is an engineering bar, not an audit. The on-wire format belongs to this tool version. Residual risks and accepted ceremony limits are in `THREAT_MODEL.md`.
+It has not had a third-party cryptographic audit. The tests cover the quorum matrix, tampered inputs, passwords, device framing, and the YubiKey checks that can be made without a card. That is an engineering bar, not an audit. The on-wire revision belongs to this binary. Residual risks and accepted ceremony limits are in `THREAT_MODEL.md`.
 
 ## Build
 
