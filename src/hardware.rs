@@ -5,7 +5,7 @@
 //! admin data, so they are refused unless `--force` is set.
 //!
 //! The `yubikey` feature is on by default. Static musl builds that cannot link
-//! PC/SC turn it off and reject `yubikey:` locations with a clear error.
+//! PC/SC turn it off and reject `yubi=` locations with a clear error.
 
 #[cfg(not(feature = "yubikey"))]
 use crate::error::Error;
@@ -243,7 +243,7 @@ pub(crate) struct AttachedYubiKey {
     pub(crate) reader: String,
 }
 
-/// YubiKeys currently available to `yubikey:` locations. Empty if none are
+/// YubiKeys currently available to `yubi=` locations. Empty if none are
 /// present. A reader that does not open is skipped; a PC/SC failure is an
 /// error.
 #[cfg(feature = "yubikey")]

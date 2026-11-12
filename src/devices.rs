@@ -2,7 +2,7 @@
 //!
 //! Each kind lists itself and appends its own variant. A kind this build
 //! cannot open is absent, not an error. A kind that is compiled in and fails
-//! to talk to its stack is an error. `device:` paths are not listed; those are
+//! to talk to its stack is an error. `device=` paths are not listed; those are
 //! nodes the operator already has.
 //!
 //! Adding a kind is a variant on [`AttachedDevice`] and a source function
@@ -24,11 +24,7 @@ impl fmt::Display for AttachedDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             | Self::YubiKey(key) => {
-                write!(
-                    f,
-                    "yubikey:{}  version {}  reader {}",
-                    key.serial, key.version, key.reader
-                )
+                write!(f, "yubi={}  version {}  reader {}", key.serial, key.version, key.reader)
             },
         }
     }
@@ -70,6 +66,6 @@ mod tests {
             version: "5.7.1".to_owned(),
             reader: "Yubico YubiKey".to_owned(),
         });
-        assert_eq!(device.to_string(), "yubikey:7  version 5.7.1  reader Yubico YubiKey");
+        assert_eq!(device.to_string(), "yubi=7  version 5.7.1  reader Yubico YubiKey");
     }
 }

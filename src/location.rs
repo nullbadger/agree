@@ -1,7 +1,9 @@
 //! Destinations for shares and restored secrets.
 //!
-//! A file path is the normal case. `device:` writes the same bytes straight to
-//! a hardware node. `yubikey:` writes them to a PIV data object.
+//! A share must name a protocol. `path=` is a file. `device=` writes the same
+//! bytes straight to a hardware node. `yubi=` writes them to a PIV data object.
+//! The separator is `=`. A sealed file or `--key-file` may still be a bare
+//! path.
 
 use {
     anyhow::{
@@ -44,12 +46,13 @@ impl Location {
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            | Self::File(path) | Self::Device(path) => write!(f, "{}", path.display()),
+            | Self::File(path) => write!(f, "path={}", path.display()),
+            | Self::Device(path) => write!(f, "device={}", path.display()),
             | Self::YubiKey {
                 serial: Some(serial),
                 object,
-            } => write!(f, "yubikey:{serial}/{object:06x}"),
-            | Self::YubiKey { serial: None, object } => write!(f, "yubikey:{object:06x}"),
+            } => write!(f, "yubi={serial}/{object:06x}"),
+            | Self::YubiKey { serial: None, object } => write!(f, "yubi={object:06x}"),
         }
     }
 }
@@ -75,14 +78,36 @@ impl Locator {
     }
 
     pub(crate) fn parse(&self, text: &str) -> Result<Location> {
-        if let Some(rest) = text.strip_prefix("yubikey:") {
+        self.parse_location(text, false)
+    }
+
+    /// A share must name `path=`, `yubi=`, or `device=`. A bare path is not a
+    /// share.
+    pub(crate) fn parse_share(&self, text: &str) -> Result<Location> {
+        self.parse_location(text, true)
+    }
+
+    fn parse_location(&self, text: &str, share: bool) -> Result<Location> {
+        if text.starts_with("yubikey:") || text.starts_with("yubi:") || text.starts_with("device:") {
+            bail!("location protocols use '=': path=, yubi=, or device=");
+        }
+        if let Some(rest) = text.strip_prefix("yubi=") {
             return parse_yubikey(rest);
         }
-        if let Some(rest) = text.strip_prefix("device:") {
+        if let Some(rest) = text.strip_prefix("device=") {
             if rest.is_empty() {
                 bail!("device path must not be empty");
             }
             return Ok(Location::Device(self.resolve_path(Path::new(rest))?));
+        }
+        if let Some(rest) = text.strip_prefix("path=") {
+            if rest.is_empty() {
+                bail!("path must not be empty");
+            }
+            return Ok(Location::File(self.resolve_path(Path::new(rest))?));
+        }
+        if share {
+            bail!("share must start with a protocol: path=, yubi=, or device=");
         }
         if text.is_empty() {
             bail!("path must not be empty");
@@ -105,7 +130,7 @@ fn parse_yubikey(text: &str) -> Result<Location> {
     let (serial, object_text) = match text.split_once('/') {
         | Some((serial, object)) => {
             if serial.is_empty() || object.is_empty() {
-                bail!("yubikey location must be yubikey:[serial/]object");
+                bail!("yubi location must be yubi=[serial/]object");
             }
             let serial = serial.parse::<u32>().context("YubiKey serial is not a number")?;
             (Some(serial), object)
@@ -123,7 +148,7 @@ pub(crate) fn resolve_unspecified_serial(attached: &[u32]) -> Result<u32> {
         | [serial] => Ok(*serial),
         | many => {
             let list = many.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
-            bail!("multiple YubiKeys are attached ({list}); use yubikey:SERIAL/object");
+            bail!("multiple YubiKeys are attached ({list}); use yubi=SERIAL/object");
         },
     }
 }
@@ -215,27 +240,39 @@ mod tests {
             Location::File(PathBuf::from("/tmp/agree/alice.share"))
         );
         assert_eq!(
-            locator.parse("device:/dev/rdisk4").unwrap(),
+            locator.parse("path=alice.share").unwrap(),
+            Location::File(PathBuf::from("/tmp/agree/alice.share"))
+        );
+        assert!(locator.parse_share("alice.share").is_err());
+        assert_eq!(
+            locator.parse_share("path=alice.share").unwrap(),
+            Location::File(PathBuf::from("/tmp/agree/alice.share"))
+        );
+        assert_eq!(
+            locator.parse("device=/dev/rdisk4").unwrap(),
             Location::Device(PathBuf::from("/dev/rdisk4"))
         );
-        assert_eq!(locator.parse("yubikey:5fff20").unwrap(), Location::YubiKey {
+        assert_eq!(locator.parse("yubi=5fff20").unwrap(), Location::YubiKey {
             serial: None,
             object: 0x005f_ff20,
         });
-        assert_eq!(locator.parse("yubikey:42/5fff21").unwrap(), Location::YubiKey {
+        assert_eq!(locator.parse("yubi=42/5fff21").unwrap(), Location::YubiKey {
             serial: Some(42),
             object: 0x005f_ff21,
         });
-        assert!(locator.parse("yubikey:5fc105").is_ok());
-        assert!(locator.parse("yubikey:5FFF20").is_ok());
-        assert!(locator.parse("yubikey:00ff").is_err());
-        assert!(locator.parse("yubikey:").is_err());
-        assert!(locator.parse("yubikey:/5fff20").is_err());
-        assert!(locator.parse("yubikey:abc/5fff20").is_err());
-        assert!(locator.parse("yubikey:4294967296/5fff20").is_err());
-        assert!(locator.parse("device:").is_err());
+        assert!(locator.parse("yubi=5fc105").is_ok());
+        assert!(locator.parse("yubi=5FFF20").is_ok());
+        assert!(locator.parse("yubi=00ff").is_err());
+        assert!(locator.parse("yubi=").is_err());
+        assert!(locator.parse("yubi=/5fff20").is_err());
+        assert!(locator.parse("yubi=abc/5fff20").is_err());
+        assert!(locator.parse("yubi=4294967296/5fff20").is_err());
+        assert!(locator.parse("device=").is_err());
+        assert!(locator.parse("path=").is_err());
+        assert!(locator.parse("yubikey:5fff20").is_err());
+        assert!(locator.parse("device:/dev/rdisk4").is_err());
         assert!(locator.parse("").is_err());
-        assert!(locator.parse("yubikey:5fffff1").is_err());
+        assert!(locator.parse("yubi=5fffff1").is_err());
     }
 
     #[test]
@@ -253,7 +290,7 @@ mod tests {
             Location::File(PathBuf::from("/home/alice"))
         );
         assert_eq!(
-            locator.parse("device:node.bin").unwrap(),
+            locator.parse("device=node.bin").unwrap(),
             Location::Device(PathBuf::from("/work/node.bin"))
         );
         let no_home = Locator {

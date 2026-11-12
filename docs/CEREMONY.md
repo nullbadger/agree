@@ -75,13 +75,13 @@ Do this with one YubiKey plugged in at a time. Unplug it before the next.
 agree devices
 ```
 
-The witness checks that the printed serial matches that custodian's row. A line looks like `yubikey:SERIAL  version …  reader …`. If two keys are plugged in, unplug one. Do not guess which serial is which.
+The witness checks that the printed serial matches that custodian's row. A line looks like `yubi=SERIAL  version …  reader …`. If two keys are plugged in, unplug one. Do not guess which serial is which.
 
 No PIN is required for this command. Nothing is written.
 
 ## Split
 
-The dealer types this command and no other. Substitute the real serials from the roster. Keep file shares first and YubiKey shares last. If every share is a YubiKey, there are five `--share yubikey:SERIAL/5fff21` arguments and no file arguments.
+The dealer types this command and no other. Substitute the real serials from the roster. Keep file shares first and YubiKey shares last. If every share is a YubiKey, there are five `--share yubi=SERIAL/5fff21` arguments and no `path=` arguments.
 
 Do not add `--key-file`. Do not add `--management-key`. Do not add `--debug`. Do not add `--force` unless a stopped earlier attempt left an object and the witness has agreed that this is a new split overwriting that object.
 
@@ -89,16 +89,16 @@ Do not add `--key-file`. Do not add `--management-key`. Do not add `--debug`. Do
 agree split \
   --threshold 3 \
   --sealed sealed.bin \
-  --share yubikey:SERIAL1/5fff21 \
-  --share yubikey:SERIAL2/5fff21 \
-  --share yubikey:SERIAL3/5fff21 \
-  --share yubikey:SERIAL4/5fff21 \
-  --share yubikey:SERIAL5/5fff21 \
+  --share yubi=SERIAL1/5fff21 \
+  --share yubi=SERIAL2/5fff21 \
+  --share yubi=SERIAL3/5fff21 \
+  --share yubi=SERIAL4/5fff21 \
+  --share yubi=SERIAL5/5fff21 \
   --protect \
   < secret-file
 ```
 
-For a row marked file, that one `--share` is a new file name instead of `yubikey:`. Example: `--share custodian3.share`. Do not point two shares at the same path. Do not point a share at `sealed.bin`.
+For a row marked file, that one `--share` is `path=` and a new file name instead of `yubi=`. Example: `--share path=custodian3.share`. Do not point two shares at the same path. Do not point a share at `sealed.bin`. A bare file name is not a share.
 
 What the tool will do, in order:
 
@@ -140,7 +140,7 @@ agree restore \
   > restored.bin
 ```
 
-`SHARE` is the file name or `yubikey:SERIAL/5fff21`. Stdout must be the redirect. If the tool refuses because stdout is a terminal, the redirect was missed. Stop and do not retry by printing the secret on the screen.
+`SHARE` is `path=` and the file name, or `yubi=SERIAL/5fff21`. Stdout must be the redirect. If the tool refuses because stdout is a terminal, the redirect was missed. Stop and do not retry by printing the secret on the screen.
 
 The tool asks for each YubiKey PIN when it needs it. It does not ask for the management key to read. A file share with a password is prompted on the terminal. An empty password for a protected file share is rejected.
 

@@ -1,6 +1,6 @@
 //! End-to-end coverage that does not open a YubiKey.
 //! The secret is always piped to `split` and captured from `restore` stdout.
-//! `device:` paths are ordinary files.
+//! `device=` paths are ordinary files.
 
 use std::{
     fs,
@@ -90,6 +90,14 @@ fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+fn share_arg(name: &str) -> String {
+    if name.contains('=') {
+        name.to_string()
+    } else {
+        format!("path={name}")
+    }
+}
+
 struct Ceremony {
     dir: Temp,
     secret: Vec<u8>,
@@ -98,11 +106,18 @@ struct Ceremony {
 impl Ceremony {
     fn split(secret: &[u8], threshold: &str, names: &[&str]) -> Self {
         let dir = Temp::new();
-        let mut args = vec!["split", "--threshold", threshold, "--sealed", "sealed.bin"];
+        let mut owned = vec![
+            "split".to_string(),
+            "--threshold".to_string(),
+            threshold.to_string(),
+            "--sealed".to_string(),
+            "sealed.bin".to_string(),
+        ];
         for name in names {
-            args.push("--share");
-            args.push(name);
+            owned.push("--share".to_string());
+            owned.push(share_arg(name));
         }
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         assert_ok(&run_in(&dir.0, &args, secret));
         Self {
             dir,
@@ -111,11 +126,12 @@ impl Ceremony {
     }
 
     fn restore(&self, shares: &[&str]) -> Vec<u8> {
-        let mut args = vec!["restore", "--sealed", "sealed.bin"];
+        let mut owned = vec!["restore".to_string(), "--sealed".to_string(), "sealed.bin".to_string()];
         for share in shares {
-            args.push("--share");
-            args.push(share);
+            owned.push("--share".to_string());
+            owned.push(share_arg(share));
         }
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         let output = run_in(&self.dir.0, &args, b"");
         assert_ok(&output);
         assert_eq!(output.stdout, self.secret);
@@ -148,9 +164,9 @@ fn three_of_five_quorum_restores_on_stdout() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
         ],
         b"",
     );
@@ -175,11 +191,11 @@ fn device_paths_carry_a_binary_secret_to_stdout() {
             "--threshold",
             "2",
             "--sealed",
-            &format!("device:{}", dir.path("device-sealed").display()),
+            &format!("device={}", dir.path("device-sealed").display()),
             "--share",
-            "plain.share",
+            "path=plain.share",
             "--share",
-            &format!("device:{}", dir.path("device-share").display()),
+            &format!("device={}", dir.path("device-share").display()),
             "--force",
         ],
         &secret,
@@ -189,11 +205,11 @@ fn device_paths_carry_a_binary_secret_to_stdout() {
         &[
             "restore",
             "--sealed",
-            &format!("device:{}", dir.path("device-sealed").display()),
+            &format!("device={}", dir.path("device-sealed").display()),
             "--share",
-            "plain.share",
+            "path=plain.share",
             "--share",
-            &format!("device:{}", dir.path("device-share").display()),
+            &format!("device={}", dir.path("device-share").display()),
         ],
         b"",
     );
@@ -215,7 +231,7 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "existing.share",
+                "path=existing.share",
             ],
             b"secret",
         ),
@@ -234,7 +250,7 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "device:node",
+                "device=node",
             ],
             b"secret",
         ),
@@ -250,7 +266,7 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "device:missing-node",
+                "device=missing-node",
                 "--force",
             ],
             b"secret",
@@ -267,7 +283,7 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "only.share",
+                "path=only.share",
             ],
             b"secret",
         ),
@@ -283,7 +299,7 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "only.share",
+                "path=only.share",
             ],
             b"secret",
         ),
@@ -299,7 +315,7 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "same.share",
                 "--share",
-                "same.share",
+                "path=same.share",
             ],
             b"secret",
         ),
@@ -315,9 +331,9 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "path=a.share",
                 "--share",
-                "a.share",
+                "path=a.share",
             ],
             b"secret",
         ),
@@ -333,7 +349,23 @@ fn refuses_unsafe_or_ambiguous_invocations() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "bare.share",
+            ],
+            b"secret",
+        ),
+        "protocol",
+    );
+    assert_err(
+        &run_in(
+            &dir.0,
+            &[
+                "split",
+                "--threshold",
+                "1",
+                "--sealed",
+                "sealed.bin",
+                "--share",
+                "path=a.share",
                 "--protect",
             ],
             b"secret",
@@ -362,9 +394,9 @@ fn failed_second_share_rolls_back_the_first() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "first.share",
+            "path=first.share",
             "--share",
-            "blocked",
+            "path=blocked",
         ],
         b"secret",
     );
@@ -385,7 +417,7 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--force",
         ],
         b"first",
@@ -401,9 +433,9 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
             "--sealed",
             "other-sealed.bin",
             "--share",
-            "b.share",
+            "path=b.share",
             "--share",
-            "c.share",
+            "path=c.share",
         ],
         b"other",
     ));
@@ -415,9 +447,9 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "path=a.share",
                 "--share",
-                "c.share",
+                "path=c.share",
             ],
             b"",
         ),
@@ -431,9 +463,9 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "path=a.share",
                 "--share",
-                "a.share",
+                "path=a.share",
             ],
             b"",
         ),
@@ -445,7 +477,7 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
     fs::write(dir.path("sealed-junk.bin"), &sealed).unwrap();
     let junk = run_in(
         &dir.0,
-        &["restore", "--sealed", "sealed-junk.bin", "--share", "a.share"],
+        &["restore", "--sealed", "sealed-junk.bin", "--share", "path=a.share"],
         b"",
     );
     assert_ok(&junk);
@@ -455,7 +487,7 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
     fs::write(dir.path("sealed-bad.bin"), &sealed).unwrap();
     let bad = run_in(
         &dir.0,
-        &["restore", "--sealed", "sealed-bad.bin", "--share", "a.share"],
+        &["restore", "--sealed", "sealed-bad.bin", "--share", "path=a.share"],
         b"",
     );
     assert!(!bad.status.success(), "{}", stderr(&bad));
@@ -467,7 +499,7 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
     fs::write(dir.path("a-bad.share"), share).unwrap();
     let bad_share = run_in(
         &dir.0,
-        &["restore", "--sealed", "sealed.bin", "--share", "a-bad.share"],
+        &["restore", "--sealed", "sealed.bin", "--share", "path=a-bad.share"],
         b"",
     );
     assert!(!bad_share.status.success(), "{}", stderr(&bad_share));
@@ -475,7 +507,7 @@ fn force_replaces_and_mixed_or_damaged_shares_fail() {
     assert_err(
         &run_in(
             &dir.0,
-            &["restore", "--sealed", "missing-sealed.bin", "--share", "a.share"],
+            &["restore", "--sealed", "missing-sealed.bin", "--share", "path=a.share"],
             b"",
         ),
         "Failed to open",
@@ -494,7 +526,7 @@ fn threshold_one_warns_and_restore_stdout_is_only_the_secret() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
         ],
         b"tilde",
     );
@@ -502,7 +534,7 @@ fn threshold_one_warns_and_restore_stdout_is_only_the_secret() {
     assert!(stderr(&split).contains("threshold 1"), "{}", stderr(&split));
     let restored = run_in(
         &dir.0,
-        &["restore", "--sealed", "sealed.bin", "--share", "a.share"],
+        &["restore", "--sealed", "sealed.bin", "--share", "path=a.share"],
         b"",
     );
     assert_ok(&restored);
@@ -522,7 +554,7 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "yubikey:00ff",
+                "yubi=00ff",
             ],
             b"secret",
         ),
@@ -537,9 +569,9 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "yubikey:1/5fff20",
+            "yubi=1/5fff20",
             "--share",
-            "yubikey:2/5fff21",
+            "yubi=2/5fff21",
         ],
         b"secret",
     );
@@ -562,7 +594,7 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "yubikey:5fff20",
+                "yubi=5fff20",
             ],
             b"secret",
         ),
@@ -578,9 +610,9 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "yubikey:1/5fff20",
+                "yubi=1/5fff20",
                 "--share",
-                "yubikey:2/5fff21",
+                "yubi=2/5fff21",
                 "--management-key",
                 "zz",
             ],
@@ -598,7 +630,7 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "yubikey:5fc105",
+                "yubi=5fc105",
             ],
             b"secret",
         ),
@@ -612,7 +644,7 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "yubikey:5fff20",
+                "yubi=5fff20",
                 "--pin-stdin",
                 "--management-key",
                 "zz",
@@ -628,7 +660,7 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "yubikey:5fff20",
+            "yubi=5fff20",
             "--pin-stdin",
         ],
         b"123456789\n",
@@ -648,9 +680,9 @@ fn yubikey_arguments_that_fail_before_any_card_is_opened() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "yubikey:111/5fff20",
+                "yubi=111/5fff20",
                 "--share",
-                "yubikey:222/5fff21",
+                "yubi=222/5fff21",
                 "--pin-stdin",
             ],
             b"123456789\n123456\n",
@@ -669,7 +701,7 @@ fn devices_lists_attached_yubikeys_without_a_pin() {
         assert!(stderr(&output).contains("no devices detected"), "{}", stderr(&output));
     } else {
         for line in stdout.lines() {
-            assert!(line.starts_with("yubikey:"), "{line}");
+            assert!(line.starts_with("yubi="), "{line}");
             assert!(line.contains("version"), "{line}");
             assert!(line.contains("reader"), "{line}");
         }
@@ -732,7 +764,7 @@ fn split_refuses_when_mlock_is_unavailable() {
     let dir = Temp::new();
     let output = run_bash(
         &dir.0,
-        "ulimit -l 0 && \"$AGREE\" split --threshold 1 --sealed sealed.bin --share a.share",
+        "ulimit -l 0 && \"$AGREE\" split --threshold 1 --sealed sealed.bin --share path=a.share",
         b"secret",
     );
     assert_err(&output, "mlock failed");
@@ -764,9 +796,9 @@ fn key_file_refuses_a_short_long_or_misplaced_source() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "path=a.share",
                 "--share",
-                "b.share",
+                "path=b.share",
             ],
             b"do-not-seal",
         );
@@ -778,8 +810,8 @@ fn key_file_refuses_a_short_long_or_misplaced_source() {
     refuse("64", "short.key", "exactly 64 bytes, got 32");
     refuse("64", "long.key", "exactly 64 bytes, got more");
     refuse("48", "missing.key", "multiple of 32");
-    refuse("32", "device:/dev/null", "device:");
-    refuse("32", "yubikey:5fff21", "yubikey:");
+    refuse("32", "device=/dev/null", "device=");
+    refuse("32", "yubi=5fff21", "yubi=");
     refuse("32", "a.share", "cannot be a share");
     refuse("32", "sealed.bin", "sealed secret");
     refuse("32", "/dev/zero", "got more");
@@ -797,9 +829,9 @@ fn key_file_refuses_a_short_long_or_misplaced_source() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
         ],
         b"do-not-seal",
     );
@@ -826,9 +858,9 @@ fn key_file_of_64_bytes_restores() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
         ],
         secret,
     );
@@ -848,9 +880,9 @@ fn key_file_of_64_bytes_restores() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "b.share",
+            "path=b.share",
             "--share",
-            "a.share",
+            "path=a.share",
         ],
         b"",
     );
@@ -871,7 +903,7 @@ fn key_file_process_substitution_is_an_exact_pipe() {
     let short = run_bash(
         &dir.0,
         "\"$AGREE\" split --threshold 2 --key-bytes 64 --key-file <(head -c 32 key.bin) --sealed sealed.bin --share \
-         a.share --share b.share",
+         path=a.share --share path=b.share",
         secret,
     );
     assert_err(&short, "exactly 64 bytes, got 32");
@@ -879,8 +911,8 @@ fn key_file_process_substitution_is_an_exact_pipe() {
 
     let extra = run_bash(
         &dir.0,
-        "\"$AGREE\" split --threshold 2 --key-bytes 64 --key-file <(cat long.key) --sealed sealed.bin --share a.share \
-         --share b.share",
+        "\"$AGREE\" split --threshold 2 --key-bytes 64 --key-file <(cat long.key) --sealed sealed.bin --share \
+         path=a.share --share path=b.share",
         secret,
     );
     assert_err(&extra, "exactly 64 bytes, got more");
@@ -888,8 +920,8 @@ fn key_file_process_substitution_is_an_exact_pipe() {
 
     let split = run_bash(
         &dir.0,
-        "\"$AGREE\" split --threshold 2 --key-bytes 64 --key-file <(cat key.bin) --sealed sealed.bin --share a.share \
-         --share b.share",
+        "\"$AGREE\" split --threshold 2 --key-bytes 64 --key-file <(cat key.bin) --sealed sealed.bin --share \
+         path=a.share --share path=b.share",
         secret,
     );
     assert_ok(&split);
@@ -901,9 +933,9 @@ fn key_file_process_substitution_is_an_exact_pipe() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
         ],
         b"",
     );
@@ -932,11 +964,11 @@ fn weighted_share_and_two_quorums_restore() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
             "--share",
-            "c.share",
+            "path=c.share",
         ],
         b"weighted-secret",
     );
@@ -944,14 +976,14 @@ fn weighted_share_and_two_quorums_restore() {
     assert!(stderr(&split).contains("share 1 alone"), "{}", stderr(&split));
     let alone = run_in(
         &dir.0,
-        &["restore", "--sealed", "sealed.bin", "--share", "a.share"],
+        &["restore", "--sealed", "sealed.bin", "--share", "path=a.share"],
         b"",
     );
     assert_ok(&alone);
     assert_eq!(alone.stdout, b"weighted-secret");
     let short = run_in(
         &dir.0,
-        &["restore", "--sealed", "sealed.bin", "--share", "b.share"],
+        &["restore", "--sealed", "sealed.bin", "--share", "path=b.share"],
         b"",
     );
     assert_err(&short, "needs weight 2");
@@ -963,9 +995,9 @@ fn weighted_share_and_two_quorums_restore() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "b.share",
+            "path=b.share",
             "--share",
-            "c.share",
+            "path=c.share",
         ],
         b"",
     );
@@ -980,13 +1012,13 @@ fn weighted_share_and_two_quorums_restore() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
             "--share",
-            "c.share",
+            "path=c.share",
             "--share",
-            "d.share",
+            "path=d.share",
             "--quorum",
             "1:1,2",
             "--quorum",
@@ -1001,9 +1033,9 @@ fn weighted_share_and_two_quorums_restore() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "a.share",
+            "path=a.share",
             "--share",
-            "b.share",
+            "path=b.share",
         ],
         b"",
     );
@@ -1016,11 +1048,11 @@ fn weighted_share_and_two_quorums_restore() {
             "--sealed",
             "sealed.bin",
             "--share",
-            "b.share",
+            "path=b.share",
             "--share",
-            "c.share",
+            "path=c.share",
             "--share",
-            "d.share",
+            "path=d.share",
         ],
         b"",
     );
@@ -1039,7 +1071,7 @@ fn weighted_share_and_two_quorums_restore() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "path=a.share",
             ],
             b"x",
         ),
@@ -1055,9 +1087,9 @@ fn weighted_share_and_two_quorums_restore() {
                 "--sealed",
                 "sealed.bin",
                 "--share",
-                "a.share",
+                "path=a.share",
                 "--share",
-                "b.share",
+                "path=b.share",
             ],
             b"x",
         ),

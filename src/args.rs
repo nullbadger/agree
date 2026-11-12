@@ -67,14 +67,14 @@ pub(crate) struct SplitArgs {
     pub(crate) key_bytes: u16,
     /// Read the data key from this path instead of generating it. A file or
     /// pipe of exactly `--key-bytes` bytes, not a command and not a
-    /// `device:` or `yubikey:` location. Stdin remains the secret.
+    /// `device=` or `yubi=` location. Stdin remains the secret.
     #[arg(long)]
     pub(crate) key_file: Option<String>,
     /// Where to write the sealed secret. Not a share, and not secret by itself.
     #[arg(long)]
     pub(crate) sealed: String,
-    /// Where to write one share. Repeat once per share. File, `device:PATH`, or
-    /// `yubikey:[serial/]OBJECT`.
+    /// Where to write one share. Repeat once per share. Must start with
+    /// `path=`, `yubi=[serial/]OBJECT`, or `device=PATH`.
     #[arg(long, required = true)]
     pub(crate) share: Vec<String>,
     /// Prompt on the terminal for an optional password per share. Stdin is the
@@ -86,7 +86,7 @@ pub(crate) struct SplitArgs {
     /// factory key. The PIN is prompted on the terminal.
     #[arg(long)]
     pub(crate) management_key: Option<String>,
-    /// Overwrite an existing file or YubiKey object. Required for `device:`
+    /// Overwrite an existing file or YubiKey object. Required for `device=`
     /// destinations.
     #[arg(short, long)]
     pub(crate) force: bool,

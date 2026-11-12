@@ -56,9 +56,9 @@ The summary lists members in custodian-index order, not the order they were type
 
 ```text
 agree split --threshold 2 \
-  --share alice.share --weight 2 \
-  --share bob.share --weight 1 \
-  --share carol.share --weight 1
+  --share path=alice.share --weight 2 \
+  --share path=bob.share --weight 1 \
+  --share path=carol.share --weight 1
 ```
 
 Alice's file holds two points. Bob's holds one. Carol's holds one. Alice alone restores the secret. Bob does not. Bob and Carol do. Split prints `warning: share 1 alone restores the secret`. That warning means the policy is threshold 1 for that person. Do not ignore it on a break-glass signing key.
@@ -70,7 +70,7 @@ Alice's file holds two points. Bob's holds one. Carol's holds one. Alice alone r
 Two quorums are not two copies of the key. The data key is the XOR of one pad per quorum. Each pad is split under that quorum's threshold. A set that misses a quorum learns nothing about that pad, and therefore nothing about the key. One quorum deals the data key itself. There is no second pad.
 
 ```text
---share cfo.share --share ciso.share --share eng.share
+--share path=cfo.share --share path=ciso.share --share path=eng.share
 --quorum 1:1,2
 --quorum 2:2,3
 ```
@@ -93,8 +93,8 @@ CISO's file holds one point of each pad. CFO never completes a restore: quorum 2
 ### Different weights in different quorums
 
 ```text
---share ceo.share --share cfo.share --share coo.share
---share ciso.share --share eng.share
+--share path=ceo.share --share path=cfo.share --share path=coo.share
+--share path=ciso.share --share path=eng.share
 --quorum 2:1=2,2,3
 --quorum 2:1=1,4=2,5
 ```
@@ -133,11 +133,11 @@ A 3-of-5 share of a 32-byte key is 113 bytes. Custodian 1 on this page, three po
 ```bash
 agree split \
   --sealed sealed.bin \
-  --share yubikey:11111111/5fff21 \
-  --share yubikey:22222222/5fff21 \
-  --share yubikey:33333333/5fff21 \
-  --share yubikey:44444444/5fff21 \
-  --share yubikey:55555555/5fff21 \
+  --share yubi=11111111/5fff21 \
+  --share yubi=22222222/5fff21 \
+  --share yubi=33333333/5fff21 \
+  --share yubi=44444444/5fff21 \
+  --share yubi=55555555/5fff21 \
   --quorum 2:1=2,2,3 \
   --quorum 2:1=1,4=2,5 \
   --protect \
@@ -149,8 +149,8 @@ Share 1 is `11111111`. Share 4 is `44444444`. The serial is not the index. Omit 
 ```bash
 agree restore \
   --sealed sealed.bin \
-  --share yubikey:11111111/5fff21 \
-  --share yubikey:44444444/5fff21 \
+  --share yubi=11111111/5fff21 \
+  --share yubi=44444444/5fff21 \
   > restored.bin
 ```
 
@@ -166,11 +166,11 @@ A 3-of-5 split prints the threshold and `any 3 shares restore the secret`. Any o
 split 5 shares, key 32 bytes
 group <32 hex characters>
 sealed sealed.bin
-share 1: yubikey:11111111/5fff21
-share 2: yubikey:22222222/5fff21
-share 3: yubikey:33333333/5fff21
-share 4: yubikey:44444444/5fff21
-share 5: yubikey:55555555/5fff21
+share 1: yubi=11111111/5fff21
+share 2: yubi=22222222/5fff21
+share 3: yubi=33333333/5fff21
+share 4: yubi=44444444/5fff21
+share 5: yubi=55555555/5fff21
 quorum 1: threshold 2, share 1 weight 2, share 2 weight 1, share 3 weight 1
 quorum 2: threshold 2, share 1 weight 1, share 4 weight 2, share 5 weight 1
 every quorum must be met
@@ -228,14 +228,14 @@ agree split \
   --key-bytes 64 \
   --key-file <(openssl rand 64) \
   --sealed sealed.bin \
-  --share a.share \
-  --share b.share \
+  --share path=a.share \
+  --share path=b.share \
   < secret.txt
 ```
 
 `agree` does not run the generator. The shell does, and the tool only reads the pipe. Do not put the key or the secret in the command line. `ps` and shell history keep arguments. `openssl rand 64` is fine because the bytes are not in `argv`. A command that prints them into its arguments is not.
 
-The path is not a `device:` or `yubikey:` location. Those are destinations. A process substitution is an ordinary path, usually `/dev/fd/N`, and that is what `--key-file` wants. The source must end. `/dev/urandom` does not, so it is rejected as longer than `--key-bytes`. `<(openssl rand 64)` ends. Stdin stays the secret. A path of `-` is a file named `-`, not the key.
+The path is not a `device=` or `yubi=` location. Those are destinations. `path=` is allowed. A bare path is also a file. A process substitution is an ordinary path, usually `/dev/fd/N`, and that is what `--key-file` wants. The source must end. `/dev/urandom` does not, so it is rejected as longer than `--key-bytes`. `<(openssl rand 64)` ends. Stdin stays the secret. A path of `-` is a file named `-`, not the key.
 
 A copy of those bytes is a way in that does not need the shares. Dice, a hardware RNG, or another machine are usable only if that record is destroyed after a test restore. A token that can produce the same bytes later makes the Shamir split optional. There is no passphrase derivation. A password you can type again is that same bypass.
 
@@ -326,32 +326,32 @@ A location is where a share, the sealed secret, or the restored secret is read o
 
 | Form | Meaning |
 | --- | --- |
-| `alice.share`, `~/keys/sealed.bin` | A file. Created mode `0600`. Not overwritten unless `--force`. `~` expands from `HOME`. |
-| `device:/dev/rdisk4` | Write or read the bytes directly on an existing node. Requires `--force` to write. The node must already exist. The write starts at offset zero and does not truncate the device, so bytes after the format remain. The reader stops at the end of the format. |
-| `yubikey:5fff21` | PIV data object `5fff21` on the only attached YubiKey. |
-| `yubikey:12345678/5fff21` | The same object on the YubiKey with that decimal serial. |
+| `path=alice.share`, `path=~/keys/sealed.bin` | A file. Created mode `0600`. Not overwritten unless `--force`. `~` expands from `HOME`. A share must use this prefix. A sealed file or `--key-file` may be a bare path. |
+| `device=/dev/rdisk4` | Write or read the bytes directly on an existing node. Requires `--force` to write. The node must already exist. The write starts at offset zero and does not truncate the device, so bytes after the format remain. The reader stops at the end of the format. |
+| `yubi=5fff21` | PIV data object `5fff21` on the only attached YubiKey. |
+| `yubi=12345678/5fff21` | The same object on the YubiKey with that decimal serial. |
 
-A path and `device:` of that same path are the same destination. The sealed secret and a share cannot share a destination. Split and restore can both use more than one YubiKey serial. Omit the serial only when one key is attached. Name it when you will swap tokens.
+The protocol separator is `=`. A colon is not a protocol. `path=` and `device=` of the same path are the same destination. A bare sealed path and `path=` of that path are the same destination. The sealed secret and a share cannot share a destination. Split and restore can both use more than one YubiKey serial. Omit the serial only when one key is attached. Name it when you will swap tokens.
 
-`device:` is the arbitrary-length hardware path. A USB stick or a raw disk can hold a sealed secret of any size the node can store. `yubikey:` is a PIV object write. It is not a filesystem, and it is not `ykman`. `agree` speaks PC/SC itself.
+`device=` is the arbitrary-length hardware path. A USB stick or a raw disk can hold a sealed secret of any size the node can store. `yubi=` is a PIV object write. It is not a filesystem, and it is not `ykman`. `agree` speaks PC/SC itself. A share that does not start with `path=`, `yubi=`, or `device=` is rejected.
 
 ## YubiKey
 
 Writable PIV object ids are `5f0000` through `5fffff`. Ids below `5fff20` hold certificates, CHUID, admin data, and attestation. Those are refused unless you pass `--force`, because a casual write would destroy key material that has nothing to do with this split. Use `5fff20` through `5fffff` for shares. One object per custodian. A weight of 2 is two points in that one object, not a second object and not a second share. Do not also give that person another object. With 3 of 5, one person holding two shares still needs a third, but they are closer than the policy you wrote down. With two quorums, one person holding a restoring set has the secret.
 
-A single PIV object holds at most 3063 bytes. That is the YubiKey 4/5 message buffer minus the object header. A 3-of-5 share fits, and so does the policy in `docs/CEREMONY-POLICY.md` at the default 32-byte key. A high weight on a 1024-byte key can pass 3063 bytes, and that destination is refused. A large sealed secret does not fit. Put shares on the keys and put the sealed secret on a file or a `device:` path. The restored secret is not written to a YubiKey: it is written only to stdout. If you point `--sealed` at a YubiKey and the payload is larger than 3063 bytes, the command fails before publishing shares. Check the size before the ceremony if the secret is large.
+A single PIV object holds at most 3063 bytes. That is the YubiKey 4/5 message buffer minus the object header. A 3-of-5 share fits, and so does the policy in `docs/CEREMONY-POLICY.md` at the default 32-byte key. A high weight on a 1024-byte key can pass 3063 bytes, and that destination is refused. A large sealed secret does not fit. Put shares on the keys and put the sealed secret on a file or a `device=` path. The restored secret is not written to a YubiKey: it is written only to stdout. If you point `--sealed` at a YubiKey and the payload is larger than 3063 bytes, the command fails before publishing shares. Check the size before the ceremony if the secret is large.
 
 Writing requires the PIV PIN and the management key. Split can write each share to a different token. On a terminal it prints `Insert YubiKey SERIAL for LOCATION, then press Enter`, then asks for that key's PIN. If `--management-key` is omitted, it then asks for that key's management key. An empty answer uses the factory key and warns. A second object on a serial already unlocked in that command reuses both. Those prompts happen before stdin is read, so a missing terminal does not consume the secret. After the split, a key that is no longer attached is asked for again before it is written.
 
 `--management-key` is 48 hex characters (24 bytes) and applies to every token in the command. Firmware 5.7 and later authenticates that value as AES-192. Older keys authenticate it as 3DES. `agree` reads the algorithm from the card. Use it only when every key shares that management key. It shows up in the process list. The prompt is how two keys get two management keys. Change the factory key, and record the new one somewhere that is not the same envelope as the share, before this is a production ceremony. A factory management key means anyone with the PIN and physical access can overwrite objects.
 
-`agree devices` prints one line per attached device this build can open. No PIN is required, and nothing is written. A YubiKey line starts with `yubikey:` and the number after it is the serial. A reader that is not a YubiKey is skipped by that source. An empty list is not an error. A build without the `yubikey` feature omits that kind and still runs the command. `device:` paths are not listed; those are nodes you already have. A new kind is another source in the same list, not a second command.
+`agree devices` prints one line per attached device this build can open. No PIN is required, and nothing is written. A YubiKey line starts with `yubi=` and the number after it is the serial. A reader that is not a YubiKey is skipped by that source. An empty list is not an error. A build without the `yubikey` feature omits that kind and still runs the command. `device=` paths are not listed; those are nodes you already have. A new kind is another source in the same list, not a second command.
 
-Omit the serial (`yubikey:5fff21`) only when one key is attached. If more than one is attached, the command stops and lists the serials instead of guessing. Name the serial when you will swap tokens. Run `agree devices` with one key inserted at a time if you need to see which serial is which.
+Omit the serial (`yubi=5fff21`) only when one key is attached. If more than one is attached, the command stops and lists the serials instead of guessing. Name the serial when you will swap tokens. Run `agree devices` with one key inserted at a time if you need to see which serial is which.
 
 Reading a share needs the PIN only. Restore asks for each key separately, so a 2-of-6 restore can use two tokens with two PINs. The insert prompt is the same as split. A second object on a key you already unlocked in that command reuses the PIN. `--pin-stdin` is one PIN line per YubiKey share, in `--share` order, then one more line if `--sealed` is a YubiKey. Password lines come after those PIN lines. Keys named by serial must already be plugged in for `--pin-stdin`; swapping keys one at a time is the terminal flow. Split has no `--pin-stdin`, because stdin is the secret.
 
-On Linux, PC/SC (`pcscd`) and `libpcsclite` must be installed. Static musl release builds are compiled with `--no-default-features` and do not link PC/SC. Those binaries reject `yubikey:` locations and tell you to use a build with the `yubikey` feature. A normal macOS build and a dynamically linked Linux build include it. There is no shell-out to `ykman`.
+On Linux, PC/SC (`pcscd`) and `libpcsclite` must be installed. Static musl release builds are compiled with `--no-default-features` and do not link PC/SC. Those binaries reject `yubi=` locations and tell you to use a build with the `yubikey` feature. A normal macOS build and a dynamically linked Linux build include it. There is no shell-out to `ykman`.
 
 A YubiKey that is the only copy of a share dies with that YubiKey. That loss is survivable only when the remaining shares still meet every quorum. For 3 of 5, any three of the other four still open it. For the policy in `docs/CEREMONY-POLICY.md`, a lost custodian 1 still leaves custodians 2, 3, and 4. A lost custodian 1 and a lost custodian 4 leaves no restoring set. Keep a durable copy of each share on media you can still find in ten years, or accept that a dead token is a lost share. Do not put the reconstructed signing key back onto a YubiKey and call that the archive. The shares remain the archive.
 
@@ -385,15 +385,15 @@ agree split < secret
     --key-bytes <32,64,...,1024>  # length; default 32; each 32 bytes is one layer
     [--key-file <path>]           # source of exactly that many bytes; not a command
     --sealed <location>
-    --share <location>            # repeat, this count is n; index 1 is the first
+    --share <protocol=location>   # path=, yubi=, or device=; repeat; index 1 is the first
     [--protect]                   # terminal prompt; stdin is already the secret
     [--management-key <48 hex>]   # every key; omit to prompt once per YubiKey
-    [--force]                     # overwrite files and YubiKey objects; required for device:
+    [--force]                     # overwrite files and YubiKey objects; required for device=
     [--debug]                     # echo the PIN and management key on this terminal
 
 agree restore > secret
     --sealed <location>
-    --share <location>            # repeat until every quorum is met
+    --share <protocol=location>   # path=, yubi=, or device=; repeat until every quorum is met
     [--password-stdin]            # one line per share, consumed before stdout is written
     [--pin-stdin]                 # one line per YubiKey share, before password lines
     [--management-key <48 hex>]
@@ -404,13 +404,13 @@ agree man -o <dir> -f manpages|markdown
 agree autocomplete -o <dir> -s bash|zsh|fish|elvish|powershell
 ```
 
-Split reads the secret only from stdin. Restore writes the secret only to stdout, and refuses when stdout is a terminal. There is no `--secret` path and no `--output` path. Share and sealed locations are still files, `device:` nodes, or YubiKey objects. `--key-file` is not one of those destinations, and it is not read from stdin. Omit it to draw the key. Pass it only when the file or pipe is exactly `--key-bytes` long.
+Split reads the secret only from stdin. Restore writes the secret only to stdout, and refuses when stdout is a terminal. There is no `--secret` path and no `--output` path. A share is `path=`, `yubi=`, or `device=`. A sealed file may be a bare path, or one of those protocols. `--key-file` is not a `device=` or `yubi=` location, and it is not read from stdin. Omit it to draw the key. Pass it only when the file or pipe is exactly `--key-bytes` long.
 
 Passwords, the YubiKey PIN, and a per-key management key for `split` are prompted on the terminal, because stdin is the secret. Those prompts read `/dev/tty`, not the redirected stdin. `--debug` echoes the PIN and management key as they are typed and prints the captured values on stderr. Share passwords stay hidden. Do not use it on a shared or recorded terminal. `restore` may read passwords and the PIN from stdin with `--password-stdin` and `--pin-stdin`. Those lines are consumed before any secret byte is written to stdout.
 
 Relative paths are resolved from the working directory. `~/` is resolved from `HOME`.
 
-A successful split prints a summary on stderr. Restore writes nothing but the secret to stdout. `agree devices` writes one line per attached device to stdout, or nothing if none are attached. A YubiKey line is `yubikey:SERIAL`. Status and errors stay on stderr.
+A successful split prints a summary on stderr. Restore writes nothing but the secret to stdout. `agree devices` writes one line per attached device to stdout, or nothing if none are attached. A YubiKey line is `yubi=SERIAL`. Status and errors stay on stderr.
 
 ## Failure behavior
 
@@ -427,9 +427,10 @@ The tool is fail-closed on the secret. These cases do not write a restored secre
 | `--key-bytes` not a multiple of 32, or outside 32 to 1024 | Rejected before the key file is opened and before any share is written. |
 | `mlock` fails | `split` and `restore` exit before prompts and before the secret is read. No share is written. |
 | `--key-file` shorter or longer than `--key-bytes` | Rejected before prompts and before any share is written. |
-| `--key-file` is `device:`, `yubikey:`, a share path, or the sealed path | Rejected. The path is not executed. |
+| `--key-file` is `device=`, `yubi=`, a share path, or the sealed path | Rejected. The path is not executed. |
 | Existing file without `--force` | Left untouched. |
-| `device:` write without `--force` | Rejected. The node is not written. |
+| `device=` write without `--force` | Rejected. The node is not written. |
+| A share without `path=`, `yubi=`, or `device=` | Rejected. |
 | Stdout is a terminal on restore | Rejected. Pipe or redirect stdout. |
 | YubiKey payload larger than 3063 bytes | Rejected. |
 | Reserved YubiKey object without `--force` | Rejected, before the card is written. |
@@ -463,7 +464,7 @@ cargo test
 cargo build --release
 ```
 
-The default build includes YubiKey support and links PC/SC. A static musl build that cannot link `libpcsclite` uses `--no-default-features`. That binary still splits and restores files and `device:` paths. It rejects `yubikey:` locations.
+The default build includes YubiKey support and links PC/SC. A static musl build that cannot link `libpcsclite` uses `--no-default-features`. That binary still splits and restores `path=` files and `device=` nodes. It rejects `yubi=` locations.
 
 ```bash
 cargo build --release --no-default-features

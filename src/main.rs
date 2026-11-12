@@ -150,7 +150,7 @@ fn split(locator: &Locator, console: &Console, args: SplitArgs) -> Result<()> {
         bail!("sealed secret and a share cannot use the same destination");
     }
     let overwrite = Overwrite::from_flag(args.force);
-    // Reject a device:, yubikey:, or colliding path before destination checks.
+    // Reject a device=, yubi=, or colliding path before destination checks.
     // Open the source after those checks and before any prompt, so a short or
     // long read fails before a YubiKey is touched, before stdin, and before
     // any share is written.
@@ -256,7 +256,7 @@ fn write_summary(policy: &Policy, key_bytes: u16, group: &[u8; 16], sealed: &Loc
 /// Resolve `--key-file` without opening it.
 ///
 /// The path is only a source of bytes. This tool does not execute it, and it
-/// is not a `device:` or `yubikey:` destination. Opening happens later, after
+/// is not a `device=` or `yubi=` destination. Opening happens later, after
 /// destination checks and before prompts.
 fn external_key_path(
     locator: &Locator,
@@ -269,7 +269,7 @@ fn external_key_path(
     };
     let location = locator.parse(text)?;
     let Location::File(path) = &location else {
-        bail!("--key-file must be a file path or a pipe, not a device: or yubikey: location");
+        bail!("--key-file must be a file path or a pipe, not a device= or yubi= location");
     };
     if same_place(&location, sealed) || shares.iter().any(|share| same_place(share, &location)) {
         bail!("key file cannot be a share or the sealed secret");
@@ -340,7 +340,7 @@ fn passwords_for_restore(
 fn parse_locations(locator: &Locator, values: &[String]) -> Result<Vec<Location>> {
     let mut locations = Vec::with_capacity(values.len());
     for value in values {
-        let location = locator.parse(value)?;
+        let location = locator.parse_share(value)?;
         if locations.iter().any(|existing| same_place(existing, &location)) {
             bail!("duplicate destination: {location}");
         }

@@ -39,7 +39,7 @@ pub(crate) enum Error {
 
     #[error(
         "YubiKey PIV objects hold at most {max} bytes; this payload is {len} bytes. Put shares on the YubiKey and the \
-         sealed secret on a file or device:"
+         sealed secret on a path= or device="
     )]
     YubiKeyTooLarge { len: usize, max: usize },
 

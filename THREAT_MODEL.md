@@ -16,7 +16,7 @@ Safety: static review of this repository. No live attack, no fuzzing of a card, 
 
 ## 0. Executive summary
 
-`agree` 1.0.0 splits an arbitrary-length secret so a quorum of shares can restore it. The secret is encrypted under a data key. One quorum splits that key with Shamir. Further quorums split pads that XOR to the key. A weight is that many Shamir points in one share file. Shares may sit on files, `device:` nodes, or YubiKey PIV objects. Split reads stdin. Restore writes stdout.
+`agree` 1.0.0 splits an arbitrary-length secret so a quorum of shares can restore it. The secret is encrypted under a data key. One quorum splits that key with Shamir. Further quorums split pads that XOR to the key. A weight is that many Shamir points in one share file. Shares may sit on `path=` files, `device=` nodes, or `yubi=` PIV objects. Split reads stdin. Restore writes stdout.
 
 This is not a multi-tenant service. The trust boundary is the dealer machine and the people who hold shares. The tool cannot make an untrusted dealer safe.
 
@@ -27,7 +27,7 @@ Top risks:
 | T-001 | High | The process that runs `split` or `restore` sees the whole secret. |
 | T-002 | High | A retained copy of `--key-file` opens the sealed secret with no shares. |
 | T-003 | High | The Shamir claim depends on unaudited `shamirs` 0.7.0. |
-| T-004 | Medium | A YubiKey or `device:` write cannot be rolled back after a later failure. |
+| T-004 | Medium | A YubiKey or `device=` write cannot be rolled back after a later failure. |
 | T-005 | Medium | Core-dump disable is best-effort. `mlock` failure now refuses to run. Swap of an unlocked data key is closed; a crash dump can still keep key bytes. |
 | T-006 | Low | Authentication failure used to be able to emit a plaintext prefix. Fixed in this tree: stdout is written only after every chunk authenticates. |
 | T-007 | Medium | No independent cryptographic audit. |
@@ -51,7 +51,7 @@ There is no network service, no account, and no second use of the secret after r
 
 ### 1.2 In scope / out of scope
 
-In scope: the `agree` binary, format v1, file / `device:` / `yubikey:` destinations, `--key-file`, passwords, weights, quorums, and the dealer machine while the process runs.
+In scope: the `agree` binary, format v1, `path=` / `device=` / `yubi=` destinations, `--key-file`, passwords, weights, quorums, and the dealer machine while the process runs.
 
 Out of scope: cloud control planes, tenant isolation, CSP physical security, Okta/FIDO2 logins, Git signing, and whatever the restored signing key is used for afterwards. N/A — this product does not run there.
 
@@ -122,7 +122,7 @@ Internet ↔ edge, tenant ↔ tenant, IdP, CI ↔ prod, and CSP management plane
 
 ### 1.8 Architecture overview
 
-One binary. `main` parses arguments and prompts. `engine` streams the secret, splits the key, and restores. `crypto` does layered XChaCha20-Poly1305 and Argon2id share wrap. `format` revision is 1. `store` publishes files by rename. `hardware` talks PC/SC. `devices` lists kinds. The default build links PC/SC. `--no-default-features` rejects `yubikey:` locations.
+One binary. `main` parses arguments and prompts. `engine` streams the secret, splits the key, and restores. `crypto` does layered XChaCha20-Poly1305 and Argon2id share wrap. `format` revision is 1. `store` publishes files by rename. `hardware` talks PC/SC. `devices` lists kinds. The default build links PC/SC. `--no-default-features` rejects `yubi=` locations.
 
 ### 1.9 Data flow diagrams
 
@@ -192,7 +192,7 @@ No user accounts. Access to a share is possession. A password is a local wrap, n
 - Restore refuses a terminal stdout.
 - Commitment is checked before decryption. Decryption of every chunk finishes before stdout is written.
 - Share passwords are not read from the secret's stdin.
-- `--key-file` is not executed and is not a `device:` or `yubikey:` location.
+- `--key-file` is not executed and is not a `device=` or `yubi=` location.
 - Key length is a multiple of 32, from 32 to 1024, checked again on restore.
 - File outputs are created `0600` and published by rename.
 - Format revision 1 is the only revision this binary reads.
@@ -221,7 +221,7 @@ None in the repository. Impact of a failed ceremony is loss or disclosure of the
 | C-3 | prevent | SHA-256 commitment of sealed bytes in every share | every restore | engine tamper tests |
 | C-4 | prevent | Stdout refused when it is a terminal | restore | CLI |
 | C-5 | prevent | `0600` and rename publish | file shares | store tests, CLI mode check |
-| C-6 | prevent | `--force` required for overwrite and `device:` | writes | CLI |
+| C-6 | prevent | `--force` required for overwrite and `device=` | writes | CLI |
 | C-7 | prevent | Reserved PIV objects refused without `--force` | YubiKey writes | hardware tests, no card opened |
 | C-8 | prevent | Key file length checked before shares are written | split | CLI and crypto tests |
 | C-9 | prevent | Plaintext held off stdout until every chunk authenticates | restore | `authentication_failure_does_not_emit_a_prefix` |
@@ -546,7 +546,7 @@ Threats: T-002
 Type: transfer
 Description: Do not retain --key-file. A pipe from a generator that exits is the shape that does not leave a file. A regenerating token is not a key source.
 Design invariant: the tool does not run a generator and does not derive a key from a password
-Verification: CLI rejects short, long, device:, and yubikey: key sources
+Verification: CLI rejects short, long, device=, and yubi= key sources
 Owner: operator
 Effort: S
 Status: done as a refusal of the wrong shapes
@@ -673,7 +673,7 @@ Verification: docs/README.md ceremony section
 REQ-002
 MUST: --key-file is a path of exact length. The tool does not execute it and does not derive the data key from a password.
 Derived_from: M-002, T-002
-Verification: CLI tests for short, long, device:, and yubikey: sources
+Verification: CLI tests for short, long, device=, and yubi= sources
 ```
 
 ```

@@ -105,7 +105,7 @@ Do this with one YubiKey plugged in at a time. Unplug it before the next.
 agree devices
 ```
 
-The witness checks that the printed serial matches that custodian's row. A line looks like `yubikey:SERIAL  version …  reader …`. If two keys are plugged in, unplug one. Do not guess which serial is which.
+The witness checks that the printed serial matches that custodian's row. A line looks like `yubi=SERIAL  version …  reader …`. If two keys are plugged in, unplug one. Do not guess which serial is which.
 
 No PIN is required for this command. Nothing is written.
 
@@ -118,18 +118,18 @@ Do not add `--threshold`. Do not add `--weight`. Do not add `--key-file`. Do not
 ```bash
 agree split \
   --sealed sealed.bin \
-  --share yubikey:SERIAL1/5fff21 \
-  --share yubikey:SERIAL2/5fff21 \
-  --share yubikey:SERIAL3/5fff21 \
-  --share yubikey:SERIAL4/5fff21 \
-  --share yubikey:SERIAL5/5fff21 \
+  --share yubi=SERIAL1/5fff21 \
+  --share yubi=SERIAL2/5fff21 \
+  --share yubi=SERIAL3/5fff21 \
+  --share yubi=SERIAL4/5fff21 \
+  --share yubi=SERIAL5/5fff21 \
   --quorum 2:1=2,2,3 \
   --quorum 2:1=1,4=2,5 \
   --protect \
   < secret-file
 ```
 
-For a row marked file, that one `--share` is a new file name instead of `yubikey:`. Example: `--share custodian3.share`. Do not point two shares at the same path. Do not point a share at `sealed.bin`. Do not put the sealed secret on a YubiKey.
+For a row marked file, that one `--share` is `path=` and a new file name instead of `yubi=`. Example: `--share path=custodian3.share`. Do not point two shares at the same path. Do not point a share at `sealed.bin`. Do not put the sealed secret on a YubiKey. A bare file name is not a share.
 
 What the tool will do, in order:
 
@@ -179,7 +179,7 @@ agree restore \
   > restored.bin
 ```
 
-`SHARE` is the file name or `yubikey:SERIAL/5fff21` from that custodian's row. Stdout must be the redirect. If the tool refuses because stdout is a terminal, the redirect was missed. Stop and do not retry by printing the secret on the screen.
+`SHARE` is `path=` and the file name, or `yubi=SERIAL/5fff21` from that custodian's row. Stdout must be the redirect. If the tool refuses because stdout is a terminal, the redirect was missed. Stop and do not retry by printing the secret on the screen.
 
 The tool asks for each YubiKey PIN when it needs it. It does not ask for the management key to read. A file share with a password is prompted on the terminal. An empty password for a protected file share is rejected.
 
