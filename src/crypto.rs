@@ -3,21 +3,47 @@
 //! The secret is chunked under a data key. Only that key is split. The key is
 //! either drawn here or supplied by the caller.
 //! A share is therefore small enough for a YubiKey object, whatever the secret
-//! length. Each chunk has its own nonce and binds the group, threshold, and
-//! chunk index, so a rearranged or swapped sealed file fails authentication.
+//! length. Each chunk has its own nonce and binds the group, the policy, and
+//! the chunk index, so a rearranged or swapped sealed file fails
+//! authentication.
 
 use {
-    crate::{error::Error, memory::DataKey, secret::Password},
-    anyhow::{bail, Context, Result},
-    argon2::{Algorithm, Argon2, Params, Version},
-    chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        ChaCha20Poly1305, XChaCha20Poly1305, XNonce,
+    crate::{
+        error::Error,
+        memory::DataKey,
+        secret::Password,
     },
-    rand_core::{OsRng, RngCore},
+    anyhow::{
+        bail,
+        Context,
+        Result,
+    },
+    argon2::{
+        Algorithm,
+        Argon2,
+        Params,
+        Version,
+    },
+    chacha20poly1305::{
+        aead::{
+            Aead,
+            KeyInit,
+            Payload,
+        },
+        ChaCha20Poly1305,
+        XChaCha20Poly1305,
+        XNonce,
+    },
+    rand_core::{
+        OsRng,
+        RngCore,
+    },
     std::{
         fs::File,
-        io::{self, Read},
+        io::{
+            self,
+            Read,
+        },
         path::Path,
     },
     zeroize::Zeroize,
@@ -40,17 +66,16 @@ pub(crate) struct SecretCipher {
     key: DataKey,
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     group: [u8; 16],
-    threshold: u8,
-    count: u8,
+    policy: Vec<u8>,
     key_bytes: u16,
 }
 
 impl SecretCipher {
-    pub(crate) fn generate(group: [u8; 16], threshold: u8, count: u8, key_bytes: usize) -> Result<Self> {
-        Ok(Self::from_key(DataKey::generate(key_bytes)?, group, threshold, count))
+    pub(crate) fn generate(group: [u8; 16], policy: &[u8], key_bytes: usize) -> Result<Self> {
+        Ok(Self::from_key(DataKey::generate(key_bytes)?, group, policy))
     }
 
-    pub(crate) fn from_key(key: DataKey, group: [u8; 16], threshold: u8, count: u8) -> Self {
+    pub(crate) fn from_key(key: DataKey, group: [u8; 16], policy: &[u8]) -> Self {
         let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
         OsRng.fill_bytes(&mut nonce_prefix);
         let key_bytes = u16::try_from(key.as_bytes().len()).expect("key size fits in u16");
@@ -58,26 +83,18 @@ impl SecretCipher {
             key,
             nonce_prefix,
             group,
-            threshold,
-            count,
+            policy: policy.to_vec(),
             key_bytes,
         }
     }
 
-    pub(crate) fn open(
-        key: DataKey,
-        nonce_prefix: [u8; NONCE_PREFIX_LEN],
-        group: [u8; 16],
-        threshold: u8,
-        count: u8,
-    ) -> Self {
+    pub(crate) fn open(key: DataKey, nonce_prefix: [u8; NONCE_PREFIX_LEN], group: [u8; 16], policy: &[u8]) -> Self {
         let key_bytes = u16::try_from(key.as_bytes().len()).expect("key size fits in u16");
         Self {
             key,
             nonce_prefix,
             group,
-            threshold,
-            count,
+            policy: policy.to_vec(),
             key_bytes,
         }
     }
@@ -97,13 +114,10 @@ impl SecretCipher {
             let nonce = XNonce::from(self.nonce(counter));
             let aad = self.aad(counter, last, u8::try_from(layer).expect("layer fits in u8"));
             current = cipher
-                .encrypt(
-                    &nonce,
-                    Payload {
-                        msg: &current,
-                        aad: &aad,
-                    },
-                )
+                .encrypt(&nonce, Payload {
+                    msg: &current,
+                    aad: &aad,
+                })
                 .map_err(|_| Error::EncryptionFailed)?;
         }
         Ok(current)
@@ -117,13 +131,10 @@ impl SecretCipher {
             let nonce = XNonce::from(self.nonce(counter));
             let aad = self.aad(counter, last, u8::try_from(layer).expect("layer fits in u8"));
             current = cipher
-                .decrypt(
-                    &nonce,
-                    Payload {
-                        msg: &current,
-                        aad: &aad,
-                    },
-                )
+                .decrypt(&nonce, Payload {
+                    msg: &current,
+                    aad: &aad,
+                })
                 .map_err(|_| Error::AuthenticationFailed)?;
         }
         Ok(current)
@@ -137,12 +148,11 @@ impl SecretCipher {
     }
 
     fn aad(&self, counter: u32, last: bool, layer: u8) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(16 + 16 + 2 + 2 + 1 + 4 + 1);
-        aad.extend_from_slice(b"agree-sealed-v2");
+        let mut aad = Vec::with_capacity(16 + 16 + 2 + self.policy.len() + 1 + 4 + 1);
+        aad.extend_from_slice(b"agree-sealed-v1");
         aad.extend_from_slice(&self.group);
-        aad.push(self.threshold);
-        aad.push(self.count);
         aad.extend_from_slice(&self.key_bytes.to_be_bytes());
+        aad.extend_from_slice(&self.policy);
         aad.push(layer);
         aad.extend_from_slice(&counter.to_be_bytes());
         aad.push(u8::from(last));
@@ -258,8 +268,18 @@ impl ShareCipher {
 #[cfg(test)]
 mod tests {
     use {
-        super::{read_key_file, SecretCipher, KEY_LEN},
-        std::{fs, io::Write, path::PathBuf, process::Command, thread},
+        super::{
+            read_key_file,
+            SecretCipher,
+            KEY_LEN,
+        },
+        std::{
+            fs,
+            io::Write,
+            path::PathBuf,
+            process::Command,
+            thread,
+        },
     };
 
     struct Temp(PathBuf);
@@ -290,8 +310,8 @@ mod tests {
 
     #[test]
     fn chunk_roundtrip_binds_the_last_flag() {
-        let cipher = SecretCipher::generate([7u8; 16], 3, 5, KEY_LEN).unwrap();
-        let wide = SecretCipher::generate([7u8; 16], 3, 5, KEY_LEN * 2).unwrap();
+        let cipher = SecretCipher::generate([7u8; 16], &[3, 5], KEY_LEN).unwrap();
+        let wide = SecretCipher::generate([7u8; 16], &[3, 5], KEY_LEN * 2).unwrap();
         let ct = wide.encrypt_chunk(1, false, b"layer").unwrap();
         assert_eq!(wide.decrypt_chunk(1, false, &ct).unwrap(), b"layer");
         assert!(wide.decrypt_chunk(1, true, &ct).is_err());

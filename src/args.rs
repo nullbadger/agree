@@ -1,12 +1,16 @@
 use {
     crate::location::Locator,
     anyhow::Result,
-    clap::{Args, Parser, Subcommand},
+    clap::{
+        Args,
+        Parser,
+        Subcommand,
+    },
     std::path::PathBuf,
 };
 
 #[derive(Parser)]
-#[command(name = "agree", version, about = "Split a secret so a threshold of shares can restore it.", author)]
+#[command(name = "agree", version, about = "Split a secret so a quorum of shares can restore it.", author)]
 pub(crate) struct Cli {
     /// Echo the YubiKey PIN and management key, then print the captured values
     /// on stderr. Share passwords stay hidden.
@@ -30,7 +34,7 @@ impl Cli {
 pub(crate) enum Command {
     /// Split a secret from stdin into shares.
     Split(SplitArgs),
-    /// Restore a secret to stdout from a sealed file and a threshold of shares.
+    /// Restore a secret to stdout from a sealed file and a quorum of shares.
     Restore(RestoreArgs),
     /// List attached hardware this build can open. Nothing is written.
     Devices,
@@ -42,9 +46,21 @@ pub(crate) enum Command {
 
 #[derive(Args)]
 pub(crate) struct SplitArgs {
-    /// Shares required to restore. For a break-glass signing key, use 3 of 5.
+    /// Shares required when there is one quorum and every weight is 1. For a
+    /// break-glass signing key, use 3 of 5. Omit this when passing `--quorum`.
     #[arg(short, long)]
-    pub(crate) threshold: u8,
+    pub(crate) threshold: Option<u8>,
+    /// Weight of one share, in `--share` order. Repeat once per share, or omit
+    /// for weight 1. A weight is that many Shamir points in the one file.
+    /// Cannot be combined with `--quorum`.
+    #[arg(long)]
+    pub(crate) weight: Vec<u8>,
+    /// A quorum that must be met, as
+    /// `THRESHOLD:INDEX[=WEIGHT],INDEX[=WEIGHT],...`. Indexes are 1-based
+    /// `--share` positions. Repeat for a quorum that must also be met. A
+    /// share listed twice is still one file. Omit to use `--threshold`.
+    #[arg(long, value_name = "SPEC")]
+    pub(crate) quorum: Vec<String>,
     /// Data-key size in bytes. Must be a multiple of 32, from 32 to 1024. Each
     /// 32 bytes is one encryption layer. Default 32.
     #[arg(long, default_value_t = 32)]
@@ -81,7 +97,7 @@ pub(crate) struct RestoreArgs {
     /// Sealed secret produced by split.
     #[arg(long)]
     pub(crate) sealed: String,
-    /// Share to restore from. Repeat until the threshold is met.
+    /// Share to restore from. Repeat until every quorum is met.
     #[arg(long, required = true)]
     pub(crate) share: Vec<String>,
     /// Read one password line per share from stdin. An empty line means that

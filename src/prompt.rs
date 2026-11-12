@@ -1,7 +1,19 @@
 use {
-    crate::{error::Error, secret::Password},
-    anyhow::{Context, Result},
-    std::io::{self, BufRead, IsTerminal, Read, Write},
+    crate::{
+        error::Error,
+        secret::Password,
+    },
+    anyhow::{
+        Context,
+        Result,
+    },
+    std::io::{
+        self,
+        BufRead,
+        IsTerminal,
+        Read,
+        Write,
+    },
 };
 
 /// Terminal and stdin prompts. Engine code does not read the console itself.
@@ -185,8 +197,14 @@ mod tty {
 
     use std::{
         fs::File,
-        io::{self, Read},
-        os::fd::{AsRawFd, RawFd},
+        io::{
+            self,
+            Read,
+        },
+        os::fd::{
+            AsRawFd,
+            RawFd,
+        },
     };
 
     pub(super) fn read_line(echo: bool) -> io::Result<String> {

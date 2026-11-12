@@ -4,11 +4,19 @@
 //! a hardware node. `yubikey:` writes them to a PIV data object.
 
 use {
-    anyhow::{bail, Context, Result},
+    anyhow::{
+        bail,
+        Context,
+        Result,
+    },
     path_clean::PathClean,
     std::{
-        env, fmt,
-        path::{Path, PathBuf},
+        env,
+        fmt,
+        path::{
+            Path,
+            PathBuf,
+        },
     },
 };
 
@@ -192,7 +200,10 @@ fn hex_value(byte: u8) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use {
-        super::{Location, Locator},
+        super::{
+            Location,
+            Locator,
+        },
         std::path::PathBuf,
     };
 
@@ -207,20 +218,14 @@ mod tests {
             locator.parse("device:/dev/rdisk4").unwrap(),
             Location::Device(PathBuf::from("/dev/rdisk4"))
         );
-        assert_eq!(
-            locator.parse("yubikey:5fff20").unwrap(),
-            Location::YubiKey {
-                serial: None,
-                object: 0x005f_ff20,
-            }
-        );
-        assert_eq!(
-            locator.parse("yubikey:42/5fff21").unwrap(),
-            Location::YubiKey {
-                serial: Some(42),
-                object: 0x005f_ff21,
-            }
-        );
+        assert_eq!(locator.parse("yubikey:5fff20").unwrap(), Location::YubiKey {
+            serial: None,
+            object: 0x005f_ff20,
+        });
+        assert_eq!(locator.parse("yubikey:42/5fff21").unwrap(), Location::YubiKey {
+            serial: Some(42),
+            object: 0x005f_ff21,
+        });
         assert!(locator.parse("yubikey:5fc105").is_ok());
         assert!(locator.parse("yubikey:5FFF20").is_ok());
         assert!(locator.parse("yubikey:00ff").is_err());
@@ -261,7 +266,10 @@ mod tests {
     #[cfg(feature = "yubikey")]
     #[test]
     fn reserved_objects_require_force_and_hex_is_strict() {
-        use super::{decode_hex, ensure_object_allowed};
+        use super::{
+            decode_hex,
+            ensure_object_allowed,
+        };
         assert!(ensure_object_allowed(0x005f_c105, false).is_err());
         assert!(ensure_object_allowed(0x005f_c105, true).is_ok());
         assert!(ensure_object_allowed(0x005f_ff20, false).is_ok());

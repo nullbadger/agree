@@ -7,7 +7,10 @@
 //! a crash report. That call can fail for an unprivileged process; callers
 //! warn and continue.
 
-use {crate::error::Error, zeroize::Zeroize};
+use {
+    crate::error::Error,
+    zeroize::Zeroize,
+};
 
 /// Disable core dumps for this process. Failure is reported by the caller.
 #[cfg(unix)]

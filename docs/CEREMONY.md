@@ -2,6 +2,8 @@
 
 Five custodians. Threshold 3. One dealer. One witness. Follow this page in order. The witness reads each step aloud. The dealer types only what this page says. Anyone in the room may say stop. A stop ends the ceremony. Do not resume a stopped ceremony on the same secret. Generate a new secret, or destroy the partial shares and start this page again from the beginning.
 
+This page is 3 of 5, every weight 1. Do not pass `--weight` or `--quorum`. A policy that uses either one is `docs/CEREMONY-POLICY.md`. Do not mix the two pages. Do not copy a flag from that page onto this command.
+
 This checklist accepts the limits in `THREAT_MODEL.md`. It does not remove them. The dealer machine sees the secret. The tests are not an audit. `shamirs` 0.7.0 is pinned and unaudited. A YubiKey write cannot be undone.
 
 ## Roles

@@ -8,7 +8,11 @@
 //! Adding a kind is a variant on [`AttachedDevice`] and a source function
 //! called from [`list`]. The command prints whatever that returns.
 
-use {crate::hardware::AttachedYubiKey, anyhow::Result, std::fmt};
+use {
+    crate::hardware::AttachedYubiKey,
+    anyhow::Result,
+    std::fmt,
+};
 
 /// One piece of hardware this build opened without a PIN.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -54,7 +58,10 @@ fn yubikeys(_found: &mut Vec<AttachedDevice>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use {super::AttachedDevice, crate::hardware::AttachedYubiKey};
+    use {
+        super::AttachedDevice,
+        crate::hardware::AttachedYubiKey,
+    };
 
     #[test]
     fn yubikey_line_uses_the_location_prefix() {

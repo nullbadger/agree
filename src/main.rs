@@ -9,6 +9,7 @@ mod format;
 mod hardware;
 mod location;
 mod memory;
+mod policy;
 mod prompt;
 mod reference;
 mod secret;
@@ -16,25 +17,68 @@ mod store;
 
 use {
     crate::{
-        args::{AutocompleteArgs, Command, ManArgs, RestoreArgs, SplitArgs},
+        args::{
+            AutocompleteArgs,
+            Command,
+            ManArgs,
+            RestoreArgs,
+            SplitArgs,
+        },
         crypto::read_key_file,
         engine::Engine,
         error::Error,
-        format::{read_share_bytes, ShareRecord},
+        format::{
+            read_share_bytes,
+            ShareRecord,
+        },
         hardware::YubiKeyStore,
-        location::{Location, Locator, YUBIKEY_OBJECT_MAX},
-        memory::{disable_core_dumps, require_mlock},
-        prompt::{refuse_terminal_stdout, Console},
+        location::{
+            Location,
+            Locator,
+            YUBIKEY_OBJECT_MAX,
+        },
+        memory::{
+            disable_core_dumps,
+            require_mlock,
+        },
+        policy::Policy,
+        prompt::{
+            refuse_terminal_stdout,
+            Console,
+        },
         secret::Password,
-        store::{create_private_file, DevicePublisher, FilePublisher, Overwrite},
+        store::{
+            create_private_file,
+            DevicePublisher,
+            FilePublisher,
+            Overwrite,
+        },
     },
-    anyhow::{bail, Context, Result},
-    rand_core::{OsRng, RngCore},
+    anyhow::{
+        bail,
+        Context,
+        Result,
+    },
+    rand_core::{
+        OsRng,
+        RngCore,
+    },
     std::{
         collections::HashMap,
-        fs::{self, File, OpenOptions},
-        io::{self, IsTerminal, Read},
-        path::{Path, PathBuf},
+        fs::{
+            self,
+            File,
+            OpenOptions,
+        },
+        io::{
+            self,
+            IsTerminal,
+            Read,
+        },
+        path::{
+            Path,
+            PathBuf,
+        },
     },
     zeroize::Zeroize,
 };
@@ -95,12 +139,11 @@ fn devices() -> Result<()> {
 
 fn split(locator: &Locator, console: &Console, args: SplitArgs) -> Result<()> {
     let key_len = crate::crypto::validate_key_bytes(args.key_bytes)?;
+    let policy = Policy::from_args(args.share.len(), args.threshold, &args.weight, &args.quorum)?;
     // Before prompts, the key file, and stdin. A refused lock must not consume
     // the secret or ask for a PIN.
     require_mlock(key_len)?;
-    if args.threshold == 1 {
-        eprintln!("warning: threshold 1 means any single share restores the secret");
-    }
+    warn_policy(&policy);
     let sealed = locator.parse(&args.sealed)?;
     let shares = parse_locations(locator, &args.share)?;
     if shares.iter().any(|share| same_place(share, &sealed)) {
@@ -136,7 +179,7 @@ fn split(locator: &Locator, console: &Console, args: SplitArgs) -> Result<()> {
     let output = engine.split(
         &mut secret,
         &mut staged_file,
-        args.threshold,
+        &policy,
         args.key_bytes,
         &passwords,
         provided_key,
@@ -170,16 +213,44 @@ fn split(locator: &Locator, console: &Console, args: SplitArgs) -> Result<()> {
         }
         return Err(err);
     }
-    eprintln!(
-        "split {} shares, threshold {}, key {} bytes\ngroup {}\nsealed {}\nany {} shares restore the secret",
-        output.count,
-        output.threshold,
-        output.key_bytes,
-        location::encode_hex(&output.group),
-        sealed,
-        output.threshold
-    );
+    write_summary(&output.policy, output.key_bytes, &output.group, &sealed, &shares);
     Ok(())
+}
+
+fn warn_policy(policy: &Policy) {
+    if policy.uniform_threshold() == Some(1) {
+        eprintln!("warning: threshold 1 means any single share restores the secret");
+        return;
+    }
+    for index in policy.lone_custodians() {
+        eprintln!("warning: share {index} alone restores the secret");
+    }
+}
+
+fn write_summary(policy: &Policy, key_bytes: u16, group: &[u8; 16], sealed: &Location, shares: &[Location]) {
+    if let Some(threshold) = policy.uniform_threshold() {
+        eprintln!(
+            "split {} shares, threshold {}, key {} bytes\ngroup {}\nsealed {}\nany {} shares restore the secret",
+            policy.count(),
+            threshold,
+            key_bytes,
+            location::encode_hex(group),
+            sealed,
+            threshold
+        );
+        return;
+    }
+    eprintln!(
+        "split {} shares, key {} bytes\ngroup {}\nsealed {}",
+        policy.count(),
+        key_bytes,
+        location::encode_hex(group),
+        sealed
+    );
+    for (offset, share) in shares.iter().enumerate() {
+        eprintln!("share {}: {share}", offset + 1);
+    }
+    eprint!("{}", policy.describe());
 }
 
 /// Resolve `--key-file` without opening it.
@@ -302,7 +373,7 @@ fn share_labels(shares: &[Location]) -> Vec<String> {
     shares.iter().map(ToString::to_string).collect()
 }
 
-fn ensure_destinations<'a>(locations: impl Iterator<Item = &'a Location>, overwrite: Overwrite) -> Result<()> {
+fn ensure_destinations<'a>(locations: impl Iterator<Item=&'a Location>, overwrite: Overwrite) -> Result<()> {
     for location in locations {
         match location {
             | Location::File(path) => FilePublisher::ensure_available(path, overwrite)?,

@@ -1,9 +1,16 @@
 use {
     crate::args::Cli,
-    anyhow::{Context, Result},
+    anyhow::{
+        Context,
+        Result,
+    },
     clap_complete::Shell,
     clap_mangen::Man,
-    std::{fs::File, io::Write, path::Path},
+    std::{
+        fs::File,
+        io::Write,
+        path::Path,
+    },
 };
 
 /// Generates manpages, markdown docs, and shell completions from the CLI.

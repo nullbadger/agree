@@ -2,62 +2,84 @@
 //! not a compatibility promise. There is no reader for any other revision,
 //! and none should be added just to open old files.
 //!
-//! Sealed file (`AGRS`):
-//! `magic || revision || threshold || count || key_bytes:u16be || group[16] ||
-//! nonce_prefix[20]` then chunks of `last:u8 || ciphertext_len:u32be ||
-//! ciphertext` until `last = 1`.
+//! Sealed file (`AGRS`), revision 1:
+//! `magic || revision || key_bytes:u16be || group[16] || nonce_prefix[20] ||
+//! policy_len:u16be || policy` then chunks of `last:u8 || ciphertext_len:u32be
+//! || ciphertext` until `last = 1`.
 //!
-//! Share (`AGRH`):
-//! `magic || revision || index || threshold || count || key_bytes:u16be ||
-//! group[16] || commitment[32] || flags || body_len:u32be || body`.
-//! `flags` bit 0 means the body is a password-sealed Shamir share. Otherwise
-//! the body is the Shamir share itself (`x || y[key_bytes]`).
+//! Share (`AGRH`), revision 1:
+//! `magic || revision || index || key_bytes:u16be || group[16] ||
+//! commitment[32] || flags || policy_len:u16be || policy || body_len:u32be ||
+//! body`. `flags` bit 0 means the body is password-sealed. Otherwise the body
+//! is the custodian index, then each quorum that custodian belongs to:
+//! `quorum_index || point_count || point...`, and each point is `x ||
+//! y[key_bytes]`.
 
 use {
-    crate::error::Error,
-    anyhow::{bail, Context, Result},
-    sha2::{Digest, Sha256},
-    std::io::{Read, Write},
+    crate::{
+        error::Error,
+        policy::{
+            Policy,
+            MAX_POLICY_LEN,
+        },
+    },
+    anyhow::{
+        bail,
+        Context,
+        Result,
+    },
+    sha2::{
+        Digest,
+        Sha256,
+    },
+    std::io::{
+        Read,
+        Write,
+    },
 };
 
-pub(crate) const FORMAT_REVISION: u8 = 2;
+pub(crate) const FORMAT_REVISION: u8 = 1;
 pub(crate) const SEALED_MAGIC: &[u8; 4] = b"AGRS";
 pub(crate) const SHARE_MAGIC: &[u8; 4] = b"AGRH";
-pub(crate) const HEADER_LEN: usize = 4 + 1 + 1 + 1 + 2 + 16 + 20;
-const SHARE_HEADER_LEN: usize = 4 + 1 + 1 + 1 + 1 + 2 + 16 + 32 + 1 + 4;
+const SEALED_PREFIX_LEN: usize = 4 + 1 + 2 + 16 + 20 + 2;
+const SHARE_PREFIX_LEN: usize = 4 + 1 + 1 + 2 + 16 + 32 + 1 + 2;
+const FLAGS_OFFSET: usize = 56;
 const FLAG_PASSWORD: u8 = 0x01;
 /// Ciphertext of one 64 KiB chunk plus one Poly1305 tag per key layer. The
 /// maximum is 32 layers. Larger lengths are rejected.
 pub(crate) const MAX_CHUNK_CIPHERTEXT: usize = 64 * 1024 + 16 * 32;
+pub(crate) const MAX_SHARE_BODY: usize = 8192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SealedHeader {
-    pub(crate) threshold: u8,
-    pub(crate) count: u8,
     pub(crate) key_bytes: u16,
     pub(crate) group: [u8; 16],
     pub(crate) nonce_prefix: [u8; 20],
+    pub(crate) policy: Policy,
 }
 
 impl SealedHeader {
     pub(crate) fn write_to<W: Write>(&self, mut out: W) -> Result<()> {
+        let policy = self.policy.bytes();
+        let policy_len = u16::try_from(policy.len()).context("policy is too large")?;
         out.write_all(SEALED_MAGIC)?;
-        out.write_all(&[FORMAT_REVISION, self.threshold, self.count])?;
+        out.write_all(&[FORMAT_REVISION])?;
         out.write_all(&self.key_bytes.to_be_bytes())?;
         out.write_all(&self.group)?;
         out.write_all(&self.nonce_prefix)?;
+        out.write_all(&policy_len.to_be_bytes())?;
+        out.write_all(policy)?;
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
-        let mut bytes = vec![0u8; HEADER_LEN];
-        reader.read_exact(&mut bytes).context("sealed header is truncated")?;
+        let bytes = read_sealed_header(reader)?;
         Self::parse(&bytes)
     }
 
     fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != HEADER_LEN || &bytes[0..4] != SEALED_MAGIC {
+        if bytes.len() < SEALED_PREFIX_LEN || &bytes[0..4] != SEALED_MAGIC {
             bail!("not an agree sealed secret");
         }
         if bytes[4] != FORMAT_REVISION {
@@ -67,16 +89,20 @@ impl SealedHeader {
             }
             .into());
         }
+        let policy_len = u16::from_be_bytes(bytes[43..45].try_into().expect("2 bytes")) as usize;
+        if bytes.len() != SEALED_PREFIX_LEN + policy_len {
+            bail!("sealed header is truncated");
+        }
         let mut group = [0u8; 16];
         let mut nonce_prefix = [0u8; 20];
-        group.copy_from_slice(&bytes[9..25]);
-        nonce_prefix.copy_from_slice(&bytes[25..45]);
+        group.copy_from_slice(&bytes[7..23]);
+        nonce_prefix.copy_from_slice(&bytes[23..43]);
+        let policy = Policy::decode(&bytes[SEALED_PREFIX_LEN..]).context("invalid policy")?;
         Ok(Self {
-            threshold: bytes[5],
-            count: bytes[6],
-            key_bytes: u16::from_be_bytes(bytes[7..9].try_into().expect("2 bytes")),
+            key_bytes: u16::from_be_bytes(bytes[5..7].try_into().expect("2 bytes")),
             group,
             nonce_prefix,
+            policy,
         })
     }
 }
@@ -85,12 +111,11 @@ impl SealedHeader {
 #[derive(Clone, Debug)]
 pub(crate) struct ShareRecord {
     pub(crate) index: u8,
-    pub(crate) threshold: u8,
-    pub(crate) count: u8,
     pub(crate) key_bytes: u16,
     pub(crate) group: [u8; 16],
     pub(crate) commitment: [u8; 32],
     pub(crate) password: bool,
+    pub(crate) policy: Policy,
     pub(crate) body: Vec<u8>,
 }
 
@@ -99,28 +124,33 @@ impl ShareRecord {
         if self.index == 0 {
             bail!("share index 0 is not valid");
         }
+        if self.body.len() > MAX_SHARE_BODY {
+            bail!("share body is too large");
+        }
+        let policy = self.policy.bytes();
+        let policy_len = u16::try_from(policy.len()).context("policy is too large")?;
+        let body_len = u32::try_from(self.body.len()).context("share body is too large")?;
         let mut flags = 0u8;
         if self.password {
             flags |= FLAG_PASSWORD;
         }
-        let len = u32::try_from(self.body.len()).context("share body is too large")?;
-        let mut out = Vec::with_capacity(SHARE_HEADER_LEN + self.body.len());
+        let mut out = Vec::with_capacity(SHARE_PREFIX_LEN + policy.len() + 4 + self.body.len());
         out.extend_from_slice(SHARE_MAGIC);
         out.push(FORMAT_REVISION);
         out.push(self.index);
-        out.push(self.threshold);
-        out.push(self.count);
         out.extend_from_slice(&self.key_bytes.to_be_bytes());
         out.extend_from_slice(&self.group);
         out.extend_from_slice(&self.commitment);
         out.push(flags);
-        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&policy_len.to_be_bytes());
+        out.extend_from_slice(policy);
+        out.extend_from_slice(&body_len.to_be_bytes());
         out.extend_from_slice(&self.body);
         Ok(out)
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < SHARE_HEADER_LEN || &bytes[0..4] != SHARE_MAGIC {
+        if bytes.len() < SHARE_PREFIX_LEN + 4 || &bytes[0..4] != SHARE_MAGIC {
             bail!("not an agree share");
         }
         if bytes[4] != FORMAT_REVISION {
@@ -134,39 +164,52 @@ impl ShareRecord {
         if index == 0 {
             bail!("share index 0 is not valid");
         }
-        let mut group = [0u8; 16];
-        let mut commitment = [0u8; 32];
-        group.copy_from_slice(&bytes[10..26]);
-        commitment.copy_from_slice(&bytes[26..58]);
-        let flags = bytes[58];
+        let flags = bytes[FLAGS_OFFSET];
         if flags & !FLAG_PASSWORD != 0 {
             bail!("share has unknown flags");
         }
-        let body_len = u32::from_be_bytes(bytes[59..63].try_into().expect("4 bytes")) as usize;
-        let body = bytes.get(63..63 + body_len).context("share body is truncated")?;
-        if bytes.len() != 63 + body_len {
+        let policy_len = u16::from_be_bytes(bytes[57..59].try_into().expect("2 bytes")) as usize;
+        if policy_len > MAX_POLICY_LEN {
+            bail!("policy is too large");
+        }
+        let body_len_at = SHARE_PREFIX_LEN + policy_len;
+        if bytes.len() < body_len_at + 4 {
+            bail!("share body is truncated");
+        }
+        let policy = Policy::decode(&bytes[SHARE_PREFIX_LEN..body_len_at]).context("invalid policy")?;
+        let body_len = u32::from_be_bytes(bytes[body_len_at..body_len_at + 4].try_into().expect("4 bytes")) as usize;
+        if body_len > MAX_SHARE_BODY {
+            bail!("share body is too large");
+        }
+        let body = bytes
+            .get(body_len_at + 4..body_len_at + 4 + body_len)
+            .context("share body is truncated")?;
+        if bytes.len() != body_len_at + 4 + body_len {
             bail!("share has trailing bytes");
         }
+        let mut group = [0u8; 16];
+        let mut commitment = [0u8; 32];
+        group.copy_from_slice(&bytes[8..24]);
+        commitment.copy_from_slice(&bytes[24..56]);
         Ok(Self {
             index,
-            threshold: bytes[6],
-            count: bytes[7],
-            key_bytes: u16::from_be_bytes(bytes[8..10].try_into().expect("2 bytes")),
+            key_bytes: u16::from_be_bytes(bytes[6..8].try_into().expect("2 bytes")),
             group,
             commitment,
             password: flags & FLAG_PASSWORD != 0,
+            policy,
             body: body.to_vec(),
         })
     }
 
     pub(crate) fn aad(&self) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(16 + 16 + 3 + 32);
-        aad.extend_from_slice(b"agree-share-v2");
+        let policy = self.policy.bytes();
+        let mut aad = Vec::with_capacity(16 + 16 + 1 + 2 + policy.len() + 32);
+        aad.extend_from_slice(b"agree-share-v1");
         aad.extend_from_slice(&self.group);
         aad.push(self.index);
-        aad.push(self.threshold);
-        aad.push(self.count);
         aad.extend_from_slice(&self.key_bytes.to_be_bytes());
+        aad.extend_from_slice(policy);
         aad.extend_from_slice(&self.commitment);
         aad
     }
@@ -181,10 +224,7 @@ pub(crate) struct SealedReader<R> {
 
 impl<R: Read> SealedReader<R> {
     pub(crate) fn open(mut inner: R) -> Result<Self> {
-        let mut header_bytes = [0u8; HEADER_LEN];
-        inner
-            .read_exact(&mut header_bytes)
-            .context("sealed secret is truncated")?;
+        let header_bytes = read_sealed_header(&mut inner)?;
         let header = SealedHeader::parse(&header_bytes)?;
         let mut hasher = Sha256::new();
         hasher.update(header_bytes);
@@ -229,7 +269,7 @@ pub(crate) struct SealedWriter<W> {
 impl<W: Write> SealedWriter<W> {
     pub(crate) fn new(mut inner: W, header: &SealedHeader) -> Result<Self> {
         let mut hasher = Sha256::new();
-        let mut encoded = Vec::with_capacity(HEADER_LEN);
+        let mut encoded = Vec::new();
         header.write_to(&mut encoded)?;
         inner.write_all(&encoded)?;
         hasher.update(&encoded);
@@ -252,18 +292,61 @@ impl<W: Write> SealedWriter<W> {
     }
 }
 
+fn read_sealed_header<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut prefix = vec![0u8; SEALED_PREFIX_LEN];
+    reader.read_exact(&mut prefix).context("sealed secret is truncated")?;
+    if &prefix[0..4] != SEALED_MAGIC {
+        bail!("not an agree sealed secret");
+    }
+    if prefix[4] != FORMAT_REVISION {
+        return Err(Error::UnsupportedRevision {
+            found: prefix[4],
+            expected: FORMAT_REVISION,
+        }
+        .into());
+    }
+    let policy_len = u16::from_be_bytes(prefix[43..45].try_into().expect("2 bytes")) as usize;
+    if policy_len > MAX_POLICY_LEN {
+        bail!("policy is too large");
+    }
+    let mut policy = vec![0u8; policy_len];
+    reader.read_exact(&mut policy).context("sealed policy is truncated")?;
+    prefix.extend(policy);
+    Ok(prefix)
+}
+
 /// Reads one share from a file or device without reading past the share.
 pub(crate) fn read_share_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
-    let mut header = vec![0u8; SHARE_HEADER_LEN];
-    reader.read_exact(&mut header).context("share is truncated")?;
-    let body_len = u32::from_be_bytes(header[59..63].try_into().expect("4 bytes")) as usize;
-    if body_len > 8192 {
+    let mut prefix = vec![0u8; SHARE_PREFIX_LEN];
+    reader.read_exact(&mut prefix).context("share is truncated")?;
+    if &prefix[0..4] != SHARE_MAGIC {
+        bail!("not an agree share");
+    }
+    if prefix[4] != FORMAT_REVISION {
+        return Err(Error::UnsupportedRevision {
+            found: prefix[4],
+            expected: FORMAT_REVISION,
+        }
+        .into());
+    }
+    let policy_len = u16::from_be_bytes(prefix[57..59].try_into().expect("2 bytes")) as usize;
+    if policy_len > MAX_POLICY_LEN {
+        bail!("policy is too large");
+    }
+    let mut policy = vec![0u8; policy_len];
+    reader.read_exact(&mut policy).context("share policy is truncated")?;
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).context("share body is truncated")?;
+    let body_len = u32::from_be_bytes(len_bytes) as usize;
+    if body_len > MAX_SHARE_BODY {
         bail!("share body is too large");
     }
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).context("share body is truncated")?;
-    header.extend(body);
-    Ok(header)
+    prefix.extend(policy);
+    prefix.extend_from_slice(&len_bytes);
+    prefix.extend(body);
+    Ok(prefix)
 }
 
 pub(crate) fn commitment_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
@@ -276,39 +359,51 @@ pub(crate) fn commitment_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SealedHeader, ShareRecord, FORMAT_REVISION};
+    use {
+        super::{
+            SealedHeader,
+            ShareRecord,
+            FLAGS_OFFSET,
+            FORMAT_REVISION,
+            SHARE_PREFIX_LEN,
+        },
+        crate::policy::Policy,
+    };
 
-    #[test]
-    fn share_roundtrip_rejects_trailing_bytes() {
-        let share = ShareRecord {
+    fn sample_share(password: bool) -> ShareRecord {
+        ShareRecord {
             index: 1,
-            threshold: 3,
-            count: 5,
             key_bytes: 32,
             group: [9u8; 16],
             commitment: [4u8; 32],
-            password: true,
+            password,
+            policy: Policy::uniform(3, 5).unwrap(),
             body: b"body".to_vec(),
-        };
+        }
+    }
+
+    #[test]
+    fn share_roundtrip_rejects_trailing_bytes() {
+        let share = sample_share(true);
         let encoded = share.encode().unwrap();
         let decoded = ShareRecord::decode(&encoded).unwrap();
         assert_eq!(decoded.index, 1);
         assert!(decoded.password);
         assert_eq!(decoded.body, b"body");
+        assert_eq!(decoded.policy, share.policy);
         let mut extra = encoded.clone();
         extra.push(0);
         assert!(ShareRecord::decode(&extra).is_err());
-        assert_eq!(FORMAT_REVISION, 2);
+        assert_eq!(FORMAT_REVISION, 1);
     }
 
     #[test]
     fn sealed_header_rejects_a_share_magic() {
         let header = SealedHeader {
-            threshold: 3,
-            count: 5,
             key_bytes: 32,
             group: [1u8; 16],
             nonce_prefix: [2u8; 20],
+            policy: Policy::uniform(3, 5).unwrap(),
         };
         let mut bytes = Vec::new();
         header.write_to(&mut bytes).unwrap();
@@ -320,12 +415,11 @@ mod tests {
     fn share_decoder_rejects_malformed_records() {
         let share = ShareRecord {
             index: 2,
-            threshold: 3,
-            count: 5,
             key_bytes: 32,
             group: [1u8; 16],
             commitment: [2u8; 32],
             password: false,
+            policy: Policy::uniform(3, 5).unwrap(),
             body: vec![2, 9, 9],
         };
         let mut encoded = share.encode().unwrap();
@@ -334,7 +428,7 @@ mod tests {
         assert!(err.contains("not this agree"), "{err}");
 
         encoded[4] = FORMAT_REVISION;
-        encoded[58] = 0x02;
+        encoded[FLAGS_OFFSET] = 0x02;
         assert!(ShareRecord::decode(&encoded)
             .unwrap_err()
             .to_string()
@@ -344,12 +438,11 @@ mod tests {
         assert!(err.contains("not an agree share"), "{err}");
         assert!(ShareRecord {
             index: 0,
-            threshold: 1,
-            count: 1,
             key_bytes: 32,
             group: [0u8; 16],
             commitment: [0u8; 32],
             password: false,
+            policy: Policy::uniform(1, 1).unwrap(),
             body: vec![1],
         }
         .encode()
@@ -364,16 +457,7 @@ mod tests {
 
     #[test]
     fn read_share_bytes_stops_before_trailing_device_bytes() {
-        let share = ShareRecord {
-            index: 1,
-            threshold: 1,
-            count: 1,
-            key_bytes: 32,
-            group: [3u8; 16],
-            commitment: [4u8; 32],
-            password: false,
-            body: vec![1, 2, 3],
-        };
+        let share = sample_share(false);
         let encoded = share.encode().unwrap();
         let mut stream = encoded.clone();
         stream.extend_from_slice(b"TRAILING-DEVICE-BYTES");
@@ -384,8 +468,10 @@ mod tests {
         std::io::Read::read_to_end(&mut cursor, &mut rest).unwrap();
         assert_eq!(rest, b"TRAILING-DEVICE-BYTES");
 
+        let policy_len = u16::from_be_bytes(encoded[57..59].try_into().unwrap()) as usize;
+        let body_len_at = SHARE_PREFIX_LEN + policy_len;
         let mut huge = encoded.clone();
-        huge[59..63].copy_from_slice(&10_000u32.to_be_bytes());
+        huge[body_len_at..body_len_at + 4].copy_from_slice(&10_000u32.to_be_bytes());
         assert!(super::read_share_bytes(&mut huge.as_slice())
             .unwrap_err()
             .to_string()
@@ -395,11 +481,10 @@ mod tests {
     #[test]
     fn sealed_reader_rejects_a_truncated_stream_and_an_oversized_chunk() {
         let header = SealedHeader {
-            threshold: 2,
-            count: 3,
             key_bytes: 32,
             group: [8u8; 16],
             nonce_prefix: [9u8; 20],
+            policy: Policy::uniform(2, 3).unwrap(),
         };
         let mut bytes = Vec::new();
         header.write_to(&mut bytes).unwrap();

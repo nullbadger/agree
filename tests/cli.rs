@@ -4,10 +4,20 @@
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::{
+        Read,
+        Write,
+    },
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::{
+        Command,
+        Output,
+        Stdio,
+    },
 };
 
 fn agree() -> Command {
@@ -902,4 +912,155 @@ fn key_file_process_substitution_is_an_exact_pipe() {
     for name in ["sealed.bin", "a.share", "b.share"] {
         assert!(!contains_slice(&fs::read(dir.path(name)).unwrap(), &key));
     }
+}
+
+#[test]
+fn weighted_share_and_two_quorums_restore() {
+    let dir = Temp::new();
+    let split = run_in(
+        &dir.0,
+        &[
+            "split",
+            "--threshold",
+            "2",
+            "--weight",
+            "2",
+            "--weight",
+            "1",
+            "--weight",
+            "1",
+            "--sealed",
+            "sealed.bin",
+            "--share",
+            "a.share",
+            "--share",
+            "b.share",
+            "--share",
+            "c.share",
+        ],
+        b"weighted-secret",
+    );
+    assert_ok(&split);
+    assert!(stderr(&split).contains("share 1 alone"), "{}", stderr(&split));
+    let alone = run_in(
+        &dir.0,
+        &["restore", "--sealed", "sealed.bin", "--share", "a.share"],
+        b"",
+    );
+    assert_ok(&alone);
+    assert_eq!(alone.stdout, b"weighted-secret");
+    let short = run_in(
+        &dir.0,
+        &["restore", "--sealed", "sealed.bin", "--share", "b.share"],
+        b"",
+    );
+    assert_err(&short, "needs weight 2");
+    assert!(short.stdout.is_empty());
+    let pair = run_in(
+        &dir.0,
+        &[
+            "restore",
+            "--sealed",
+            "sealed.bin",
+            "--share",
+            "b.share",
+            "--share",
+            "c.share",
+        ],
+        b"",
+    );
+    assert_ok(&pair);
+    assert_eq!(pair.stdout, b"weighted-secret");
+
+    let dir = Temp::new();
+    assert_ok(&run_in(
+        &dir.0,
+        &[
+            "split",
+            "--sealed",
+            "sealed.bin",
+            "--share",
+            "a.share",
+            "--share",
+            "b.share",
+            "--share",
+            "c.share",
+            "--share",
+            "d.share",
+            "--quorum",
+            "1:1,2",
+            "--quorum",
+            "2:2=1,3,4",
+        ],
+        b"two-quorum-secret",
+    ));
+    let missing = run_in(
+        &dir.0,
+        &[
+            "restore",
+            "--sealed",
+            "sealed.bin",
+            "--share",
+            "a.share",
+            "--share",
+            "b.share",
+        ],
+        b"",
+    );
+    assert_err(&missing, "quorum 2");
+    assert!(missing.stdout.is_empty());
+    let opened = run_in(
+        &dir.0,
+        &[
+            "restore",
+            "--sealed",
+            "sealed.bin",
+            "--share",
+            "b.share",
+            "--share",
+            "c.share",
+            "--share",
+            "d.share",
+        ],
+        b"",
+    );
+    assert_ok(&opened);
+    assert_eq!(opened.stdout, b"two-quorum-secret");
+
+    assert_err(
+        &run_in(
+            &dir.0,
+            &[
+                "split",
+                "--threshold",
+                "1",
+                "--quorum",
+                "1:1",
+                "--sealed",
+                "sealed.bin",
+                "--share",
+                "a.share",
+            ],
+            b"x",
+        ),
+        "cannot be combined",
+    );
+    assert_err(
+        &run_in(
+            &dir.0,
+            &[
+                "split",
+                "--quorum",
+                "1:1",
+                "--sealed",
+                "sealed.bin",
+                "--share",
+                "a.share",
+                "--share",
+                "b.share",
+            ],
+            b"x",
+        ),
+        "no quorum",
+    );
 }

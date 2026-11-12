@@ -6,11 +6,24 @@
 
 use {
     crate::error::Error,
-    anyhow::{Context, Result},
+    anyhow::{
+        Context,
+        Result,
+    },
     std::{
-        fs::{self, File, OpenOptions},
-        io::{self, Write},
-        path::{Path, PathBuf},
+        fs::{
+            self,
+            File,
+            OpenOptions,
+        },
+        io::{
+            self,
+            Write,
+        },
+        path::{
+            Path,
+            PathBuf,
+        },
     },
 };
 
@@ -223,8 +236,16 @@ impl IsTerminalFile for File {
 #[cfg(test)]
 mod tests {
     use {
-        super::{DevicePublisher, FilePublisher, Overwrite},
-        std::{fs, os::unix::fs::PermissionsExt, path::PathBuf},
+        super::{
+            DevicePublisher,
+            FilePublisher,
+            Overwrite,
+        },
+        std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            path::PathBuf,
+        },
     };
 
     struct TempDir(PathBuf);

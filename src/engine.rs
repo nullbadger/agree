@@ -1,25 +1,55 @@
 //! Split and restore.
 //!
-//! The secret is streamed. Shares hold only a Shamir share of the data key,
-//! plus a commitment to the sealed bytes. The key length is a multiple of 32.
-//! Each 32-byte piece is one encryption layer. Fewer than `threshold` shares
-//! cannot produce a key that authenticates.
+//! The secret is streamed. Shares hold Shamir points of one pad per quorum,
+//! plus a commitment to the sealed bytes. One quorum deals the data key
+//! itself. Further quorums deal independent pads that XOR to that key. The
+//! key length is a multiple of 32. Each 32-byte piece is one encryption
+//! layer. A set that misses a quorum cannot produce a key that authenticates.
 
 use {
     crate::{
-        crypto::{validate_key_bytes, SecretCipher, ShareCipher, CHUNK_LEN},
+        crypto::{
+            validate_key_bytes,
+            SecretCipher,
+            ShareCipher,
+            CHUNK_LEN,
+        },
         error::Error,
-        format::{commitment_eq, SealedHeader, SealedReader, SealedWriter, ShareRecord},
+        format::{
+            commitment_eq,
+            SealedHeader,
+            SealedReader,
+            SealedWriter,
+            ShareRecord,
+        },
         memory::DataKey,
+        policy::Policy,
         secret::Password,
         store::create_private_file,
     },
-    anyhow::{bail, Context, Result},
-    rand_core::{OsRng, RngCore},
-    shamirs::{Share as ShamirShare, Sharks},
+    anyhow::{
+        bail,
+        Context,
+        Result,
+    },
+    rand_core::{
+        OsRng,
+        RngCore,
+    },
+    shamirs::{
+        Share as ShamirShare,
+        Sharks,
+    },
     std::{
-        fs::{self, File},
-        io::{self, Read, Write},
+        fs::{
+            self,
+            File,
+        },
+        io::{
+            self,
+            Read,
+            Write,
+        },
         path::PathBuf,
     },
     zeroize::Zeroize,
@@ -42,13 +72,15 @@ impl Engine {
         &self,
         secret: &mut R,
         sealed: &mut W,
-        threshold: u8,
+        policy: &Policy,
         key_bytes: u16,
         passwords: &[Option<Password>],
         key: Option<DataKey>,
     ) -> Result<SplitOutput> {
         let count = u8::try_from(passwords.len()).context("too many shares")?;
-        validate_scheme(threshold, count)?;
+        if policy.count() != count {
+            bail!("password count does not match share count");
+        }
         let key_len = validate_key_bytes(key_bytes)?;
         if let Some(provided) = &key {
             if provided.as_bytes().len() != key_len {
@@ -58,42 +90,50 @@ impl Engine {
         let mut group = [0u8; 16];
         OsRng.fill_bytes(&mut group);
         let cipher = match key {
-            | Some(key) => SecretCipher::from_key(key, group, threshold, count),
-            | None => SecretCipher::generate(group, threshold, count, key_len)?,
+            | Some(key) => SecretCipher::from_key(key, group, policy.bytes()),
+            | None => SecretCipher::generate(group, policy.bytes(), key_len)?,
         };
         let header = SealedHeader {
-            threshold,
-            count,
             key_bytes,
             group,
             nonce_prefix: *cipher.nonce_prefix(),
+            policy: policy.clone(),
         };
         let mut writer = SealedWriter::new(&mut *sealed, &header)?;
         stream_encrypt(&cipher, secret, &mut writer)?;
         let commitment = writer.commitment();
-        let shamir = deal(cipher.key_bytes(), threshold, usize::from(count))?;
+        let pads = split_pads(cipher.key_bytes(), policy.quorums().len())?;
+        let bundles = bundle_points(policy, &pads)?;
         let mut encoded = Vec::with_capacity(passwords.len());
-        for (index, (body, password)) in shamir.iter().zip(passwords).enumerate() {
+        for (offset, (mut bundle, password)) in bundles.into_iter().zip(passwords).enumerate() {
+            let index = u8::try_from(offset + 1).expect("count fits in u8");
+            let mut body = encode_body(index, &bundle);
+            for dealt in &mut bundle {
+                for point in &mut dealt.points {
+                    point.zeroize();
+                }
+            }
             let mut record = ShareRecord {
-                index: u8::try_from(index + 1).expect("count fits in u8"),
-                threshold,
-                count,
+                index,
                 key_bytes,
                 group,
                 commitment,
                 password: password.is_some(),
-                body: body.clone(),
+                policy: policy.clone(),
+                body: Vec::new(),
             };
             if let Some(password) = password {
                 let aad = record.aad();
-                record.body = self.shares.seal(body, password, &aad)?;
+                record.body = self.shares.seal(&body, password, &aad)?;
+                body.zeroize();
+            } else {
+                record.body = body;
             }
             encoded.push(record.encode()?);
         }
         Ok(SplitOutput {
             group,
-            threshold,
-            count,
+            policy: policy.clone(),
             key_bytes,
             shares: encoded,
         })
@@ -110,34 +150,40 @@ impl Engine {
             bail!("password count does not match share count");
         }
         let records = decode_shares(encoded)?;
-        let opened = self.open_shares(&records, passwords)?;
-        let threshold = records[0].threshold;
-        if opened.len() < usize::from(threshold) {
-            return Err(Error::NeedShares {
-                need: threshold,
-                got: opened.len(),
+        let indexes = records.iter().map(|record| record.index).collect::<Vec<_>>();
+        if let Some(short) = records[0].policy.shortfall(&indexes) {
+            if records[0].policy.uniform_threshold().is_some() {
+                return Err(Error::NeedShares {
+                    need: short.need,
+                    got: indexes.len(),
+                }
+                .into());
+            }
+            return Err(Error::NeedWeight {
+                quorum: short.quorum,
+                need: short.need,
+                got: short.got,
             }
             .into());
         }
+        let opened = Wipe(self.open_shares(&records, passwords)?);
         let staged = self.stage_sealed(sealed)?;
         if !commitment_eq(&staged.commitment, &records[0].commitment) {
             return Err(Error::WrongGroup.into());
         }
         if staged.header.group != records[0].group
-            || staged.header.threshold != records[0].threshold
-            || staged.header.count != records[0].count
+            || staged.header.policy != records[0].policy
             || staged.header.key_bytes != records[0].key_bytes
         {
             return Err(Error::WrongGroup.into());
         }
         let key_len = validate_key_bytes(records[0].key_bytes)?;
-        let key = recover(&opened, threshold, key_len)?;
+        let key = combine(&records, &opened.0, key_len)?;
         let cipher = SecretCipher::open(
             key,
             staged.header.nonce_prefix,
             staged.header.group,
-            staged.header.threshold,
-            staged.header.count,
+            staged.header.policy.bytes(),
         );
         decrypt_staged(&cipher, &staged, output)?;
         Ok(())
@@ -152,9 +198,6 @@ impl Engine {
             } else {
                 record.body.clone()
             };
-            if body.first().copied() != Some(record.index) {
-                return Err(Error::AuthenticationFailed.into());
-            }
             opened.push(body);
         }
         Ok(opened)
@@ -189,8 +232,7 @@ impl Engine {
 
 pub(crate) struct SplitOutput {
     pub(crate) group: [u8; 16],
-    pub(crate) threshold: u8,
-    pub(crate) count: u8,
+    pub(crate) policy: Policy,
     pub(crate) key_bytes: u16,
     pub(crate) shares: Vec<Vec<u8>>,
 }
@@ -205,16 +247,6 @@ impl Drop for StagedSealed {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
-}
-
-fn validate_scheme(threshold: u8, count: u8) -> Result<()> {
-    if threshold == 0 || count == 0 {
-        bail!("threshold and share count must be greater than 0");
-    }
-    if threshold > count {
-        bail!("threshold {threshold} exceeds share count {count}");
-    }
-    Ok(())
 }
 
 fn stream_encrypt<R: Read, W: Write>(
@@ -291,25 +323,179 @@ fn decode_shares(encoded: &[Vec<u8>]) -> Result<Vec<ShareRecord>> {
             return Err(Error::DuplicateShare.into());
         }
         seen.push(record.index);
+        if record.index > record.policy.count() {
+            bail!("share index {} is not in this split", record.index);
+        }
         if let Some(first) = records.first() {
             if record.group != first.group
-                || record.threshold != first.threshold
-                || record.count != first.count
+                || record.policy != first.policy
                 || record.key_bytes != first.key_bytes
                 || !commitment_eq(&record.commitment, &first.commitment)
             {
                 return Err(Error::WrongGroup.into());
             }
         }
-        if record.threshold == 0 || record.threshold > record.count {
-            bail!("share has an invalid threshold");
-        }
-        if records.len() >= usize::from(record.count) {
+        if records.len() >= usize::from(record.policy.count()) {
             bail!("received more shares than this secret was split into");
         }
         records.push(record);
     }
     Ok(records)
+}
+
+/// One quorum deals the data key. Further quorums deal pads that XOR to it.
+fn split_pads(key: &[u8], n: usize) -> Result<Vec<DataKey>> {
+    if n == 0 {
+        bail!("at least one quorum is required");
+    }
+    if n == 1 {
+        return Ok(vec![DataKey::from_bytes(key.to_vec())?]);
+    }
+    let mut acc = key.to_vec();
+    let mut pads = Vec::with_capacity(n);
+    for _ in 0..n - 1 {
+        let mut pad = vec![0u8; key.len()];
+        OsRng.fill_bytes(&mut pad);
+        for (left, right) in acc.iter_mut().zip(&pad) {
+            *left ^= *right;
+        }
+        match DataKey::from_bytes(pad) {
+            | Ok(locked) => pads.push(locked),
+            | Err(err) => {
+                acc.zeroize();
+                return Err(err.into());
+            },
+        }
+    }
+    pads.push(DataKey::from_bytes(acc)?);
+    Ok(pads)
+}
+
+struct DealtQuorum {
+    index: u8,
+    points: Vec<Vec<u8>>,
+}
+
+fn bundle_points(policy: &Policy, pads: &[DataKey]) -> Result<Vec<Vec<DealtQuorum>>> {
+    let mut bundles = Vec::with_capacity(usize::from(policy.count()));
+    for _ in 0..policy.count() {
+        bundles.push(Vec::new());
+    }
+    for (offset, (quorum, pad)) in policy.quorums().iter().zip(pads).enumerate() {
+        let quorum_index = u8::try_from(offset + 1).expect("quorum count fits");
+        let mut points = deal(pad.as_bytes(), quorum.threshold(), quorum.total_weight())?;
+        for member in quorum.members() {
+            let n = usize::from(member.weight());
+            let taken = points.drain(..n).collect();
+            bundles[usize::from(member.index() - 1)].push(DealtQuorum {
+                index: quorum_index,
+                points: taken,
+            });
+        }
+        for point in &mut points {
+            point.zeroize();
+        }
+    }
+    Ok(bundles)
+}
+
+fn encode_body(index: u8, bundle: &[DealtQuorum]) -> Vec<u8> {
+    let mut body = vec![index];
+    for dealt in bundle {
+        body.push(dealt.index);
+        body.push(u8::try_from(dealt.points.len()).expect("weight fits in u8"));
+        for point in &dealt.points {
+            body.extend_from_slice(point);
+        }
+    }
+    body
+}
+
+fn combine(records: &[ShareRecord], opened: &[Vec<u8>], key_len: usize) -> Result<DataKey> {
+    let policy = &records[0].policy;
+    let mut by_quorum = vec![Vec::new(); policy.quorums().len()];
+    for (record, body) in records.iter().zip(opened) {
+        for dealt in parse_points(body, record.index, key_len, policy)? {
+            let slot = &mut by_quorum[usize::from(dealt.index - 1)];
+            slot.extend(dealt.points);
+        }
+    }
+    let mut pads = Vec::with_capacity(policy.quorums().len());
+    let combined = (|| {
+        for (quorum, points) in policy.quorums().iter().zip(&by_quorum) {
+            distinct_points(points)?;
+            pads.push(recover(points, quorum.threshold(), key_len)?);
+        }
+        xor_pads(pads)
+    })();
+    for points in &mut by_quorum {
+        for point in points {
+            point.zeroize();
+        }
+    }
+    combined
+}
+
+fn parse_points(body: &[u8], index: u8, key_len: usize, policy: &Policy) -> Result<Vec<DealtQuorum>> {
+    if body.first().copied() != Some(index) {
+        return Err(Error::AuthenticationFailed.into());
+    }
+    let point_len = 1 + key_len;
+    let mut rest = &body[1..];
+    let mut parsed = Vec::new();
+    for (quorum, weight) in policy.membership(index) {
+        if rest.len() < 2 {
+            return Err(Error::AuthenticationFailed.into());
+        }
+        let found_quorum = rest[0];
+        let found_weight = rest[1];
+        rest = &rest[2..];
+        if found_quorum != quorum || found_weight != weight {
+            return Err(Error::AuthenticationFailed.into());
+        }
+        let mut points = Vec::with_capacity(usize::from(weight));
+        for _ in 0..weight {
+            if rest.len() < point_len {
+                return Err(Error::AuthenticationFailed.into());
+            }
+            let point = rest[..point_len].to_vec();
+            if point[0] == 0 {
+                return Err(Error::AuthenticationFailed.into());
+            }
+            points.push(point);
+            rest = &rest[point_len..];
+        }
+        parsed.push(DealtQuorum { index: quorum, points });
+    }
+    if !rest.is_empty() {
+        return Err(Error::AuthenticationFailed.into());
+    }
+    Ok(parsed)
+}
+
+fn distinct_points(points: &[Vec<u8>]) -> Result<()> {
+    let mut seen = Vec::new();
+    for point in points {
+        let x = *point.first().ok_or(Error::AuthenticationFailed)?;
+        if x == 0 || seen.contains(&x) {
+            return Err(Error::AuthenticationFailed.into());
+        }
+        seen.push(x);
+    }
+    Ok(())
+}
+
+fn xor_pads(pads: Vec<DataKey>) -> Result<DataKey> {
+    let Some(first) = pads.first() else {
+        bail!("at least one quorum is required");
+    };
+    let mut acc = first.as_bytes().to_vec();
+    for pad in pads.iter().skip(1) {
+        for (left, right) in acc.iter_mut().zip(pad.as_bytes()) {
+            *left ^= *right;
+        }
+    }
+    Ok(DataKey::from_bytes(acc)?)
 }
 
 fn decrypt_staged<W: Write>(cipher: &SecretCipher, staged: &StagedSealed, output: &mut W) -> Result<()> {
@@ -324,6 +510,16 @@ fn decrypt_staged<W: Write>(cipher: &SecretCipher, staged: &StagedSealed, output
     let mut input = File::open(&plain_path).context("Failed to read restored secret")?;
     io::copy(&mut input, output).context("Failed to write restored secret")?;
     Ok(())
+}
+
+struct Wipe(Vec<Vec<u8>>);
+
+impl Drop for Wipe {
+    fn drop(&mut self) {
+        for buf in &mut self.0 {
+            buf.zeroize();
+        }
+    }
 }
 
 struct RemoveOnDrop(PathBuf);
@@ -396,8 +592,17 @@ fn temp_name() -> String {
 mod tests {
     use {
         super::Engine,
-        crate::{format::ShareRecord, memory::DataKey, secret::Password},
-        std::{fs, io::Cursor, path::PathBuf},
+        crate::{
+            format::ShareRecord,
+            memory::DataKey,
+            policy::Policy,
+            secret::Password,
+        },
+        std::{
+            fs,
+            io::Cursor,
+            path::PathBuf,
+        },
     };
 
     struct TempDir(PathBuf);
@@ -422,12 +627,17 @@ mod tests {
         Engine::new(dir.0.clone())
     }
 
+    fn policy_of(threshold: u8, count: usize) -> Policy {
+        Policy::uniform(threshold, u8::try_from(count).unwrap()).unwrap()
+    }
+
     fn roundtrip(secret: &[u8], threshold: u8, passwords: &[Option<Password>]) {
         let dir = TempDir::new();
         let engine = engine(&dir);
         let mut sealed = Vec::new();
+        let policy = policy_of(threshold, passwords.len());
         let split = engine
-            .split(&mut Cursor::new(secret), &mut sealed, threshold, 32, passwords, None)
+            .split(&mut Cursor::new(secret), &mut sealed, &policy, 32, passwords, None)
             .unwrap();
         assert_eq!(split.shares.len(), passwords.len());
         if secret.len() >= 16 {
@@ -460,8 +670,16 @@ mod tests {
         let password = Password::new("share-password".to_owned()).unwrap();
         let mut sealed = Vec::new();
         let passwords = [None, Some(password.clone()), None];
+        let policy = policy_of(2, passwords.len());
         let split = engine
-            .split(&mut Cursor::new(b"secret-bytes"), &mut sealed, 2, 32, &passwords, None)
+            .split(
+                &mut Cursor::new(b"secret-bytes"),
+                &mut sealed,
+                &policy,
+                32,
+                &passwords,
+                None,
+            )
             .unwrap();
         let mut restored = Vec::new();
         assert!(engine
@@ -493,8 +711,9 @@ mod tests {
         let engine = engine(&dir);
         let passwords = vec![None; count];
         let mut sealed = Vec::new();
+        let policy = policy_of(threshold, count);
         let split = engine
-            .split(&mut Cursor::new(secret), &mut sealed, threshold, 32, &passwords, None)
+            .split(&mut Cursor::new(secret), &mut sealed, &policy, 32, &passwords, None)
             .unwrap();
         // Keep the temp dir alive until the split returns; staging files are inside the
         // sealed buffer.
@@ -579,8 +798,9 @@ mod tests {
         ];
         let secret = b"quorum secret";
         let mut sealed = Vec::new();
+        let policy = policy_of(3, passwords.len());
         let split = engine
-            .split(&mut Cursor::new(secret), &mut sealed, 3, 32, &passwords, None)
+            .split(&mut Cursor::new(secret), &mut sealed, &policy, 32, &passwords, None)
             .unwrap();
         let mut restored = Vec::new();
         engine
@@ -610,12 +830,11 @@ mod tests {
         );
 
         let err = engine
-            .restore(
-                Cursor::new(sealed.clone()),
-                &mut restored,
-                &split.shares[0..3],
-                &[passwords[0].clone(), None, passwords[2].clone()],
-            )
+            .restore(Cursor::new(sealed.clone()), &mut restored, &split.shares[0..3], &[
+                passwords[0].clone(),
+                None,
+                passwords[2].clone(),
+            ])
             .unwrap_err()
             .to_string();
         assert!(err.contains("password protected"), "{err}");
@@ -649,14 +868,15 @@ mod tests {
         roundtrip_with_key(&large, 2, 96, &[None, None, None]);
         let dir = TempDir::new();
         let engine = engine(&dir);
+        let one = policy_of(1, 1);
         let err = engine
-            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 1, 48, &[None], None)
+            .split(&mut Cursor::new(b"x"), &mut Vec::new(), &one, 48, &[None], None)
             .err()
             .expect("48-byte key must fail")
             .to_string();
         assert!(err.contains("multiple of 32"), "{err}");
         let err = engine
-            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 1, 0, &[None], None)
+            .split(&mut Cursor::new(b"x"), &mut Vec::new(), &one, 0, &[None], None)
             .err()
             .expect("empty key must fail")
             .to_string();
@@ -667,11 +887,12 @@ mod tests {
         let dir = TempDir::new();
         let engine = engine(&dir);
         let mut sealed = Vec::new();
+        let policy = policy_of(threshold, passwords.len());
         let split = engine
             .split(
                 &mut Cursor::new(secret),
                 &mut sealed,
-                threshold,
+                &policy,
                 key_bytes,
                 passwords,
                 None,
@@ -696,19 +917,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_schemes_and_foreign_shares() {
-        let dir = TempDir::new();
-        let engine = engine(&dir);
-        let err = engine
-            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 0, 32, &[None], None)
-            .err()
-            .expect("threshold 0 must fail")
-            .to_string();
+        let err = Policy::uniform(0, 1).unwrap_err().to_string();
         assert!(err.contains("greater than 0"), "{err}");
-        let err = engine
-            .split(&mut Cursor::new(b"x"), &mut Vec::new(), 3, 32, &[None, None], None)
-            .err()
-            .expect("threshold above share count must fail")
-            .to_string();
+        let err = Policy::uniform(3, 2).unwrap_err().to_string();
         assert!(err.contains("exceeds"), "{err}");
 
         let (sealed_a, shares_a) = split_of(b"alpha", 2, 2);
@@ -728,22 +939,25 @@ mod tests {
         raw[63] = 0xee;
         let secret = b"external-key-secret";
         let mut sealed = Vec::new();
+        let policy = policy_of(2, 2);
         let split = engine
             .split(
                 &mut Cursor::new(&secret[..]),
                 &mut sealed,
-                2,
+                &policy,
                 64,
                 &[None, None],
                 Some(DataKey::from_bytes(raw.clone()).unwrap()),
             )
             .unwrap();
-        let bodies = split
-            .shares
-            .iter()
-            .map(|bytes| ShareRecord::decode(bytes).unwrap().body)
-            .collect::<Vec<_>>();
-        let recovered = super::recover(&bodies, 2, 64).unwrap();
+        let mut points = Vec::new();
+        for bytes in &split.shares {
+            let record = ShareRecord::decode(bytes).unwrap();
+            let parsed = super::parse_points(&record.body, record.index, 64, &record.policy).unwrap();
+            assert_eq!(parsed.len(), 1);
+            points.extend(parsed.into_iter().flat_map(|dealt| dealt.points));
+        }
+        let recovered = super::recover(&points, 2, 64).unwrap();
         assert_eq!(recovered.as_bytes(), raw.as_slice());
         let mut restored = Vec::new();
         engine
@@ -752,11 +966,12 @@ mod tests {
         assert_eq!(restored, secret);
 
         let mut empty = Vec::new();
+        let one = policy_of(1, 1);
         let err = engine
             .split(
                 &mut Cursor::new(b"x"),
                 &mut empty,
-                1,
+                &one,
                 64,
                 &[None],
                 Some(DataKey::from_bytes(vec![1; 32]).unwrap()),
@@ -769,9 +984,71 @@ mod tests {
     }
 
     #[test]
+    fn weight_and_a_second_quorum_are_enforced() {
+        let dir = TempDir::new();
+        let engine = engine(&dir);
+        let weighted = Policy::single(2, &[2, 1, 1]).unwrap();
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(
+                &mut Cursor::new(b"weighted"),
+                &mut sealed,
+                &weighted,
+                32,
+                &[None, None, None],
+                None,
+            )
+            .unwrap();
+        let mut restored = Vec::new();
+        engine
+            .restore(Cursor::new(&sealed), &mut restored, &split.shares[0..1], &[None])
+            .unwrap();
+        assert_eq!(restored, b"weighted");
+        let err = engine
+            .restore(Cursor::new(&sealed), &mut Vec::new(), &split.shares[1..2], &[None])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs weight 2"), "{err}");
+        restored.clear();
+        engine
+            .restore(Cursor::new(&sealed), &mut restored, &split.shares[1..], &[None, None])
+            .unwrap();
+        assert_eq!(restored, b"weighted");
+
+        let specs = vec!["1:1,2".to_string(), "2:2,3,4".to_string()];
+        let both = Policy::from_args(4, None, &[], &specs).unwrap();
+        let mut sealed = Vec::new();
+        let split = engine
+            .split(
+                &mut Cursor::new(b"both-quorums"),
+                &mut sealed,
+                &both,
+                32,
+                &[None, None, None, None],
+                Some(DataKey::from_bytes(vec![0x5a; 32]).unwrap()),
+            )
+            .unwrap();
+        let err = engine
+            .restore(Cursor::new(&sealed), &mut Vec::new(), &split.shares[0..2], &[
+                None, None,
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quorum 2"), "{err}");
+        restored.clear();
+        engine
+            .restore(Cursor::new(&sealed), &mut restored, &split.shares[1..], &[
+                None, None, None,
+            ])
+            .unwrap();
+        assert_eq!(restored, b"both-quorums");
+    }
+
+    #[test]
     fn authentication_failure_does_not_emit_a_prefix() {
         let dir = TempDir::new();
-        let cipher = crate::crypto::SecretCipher::generate([1u8; 16], 1, 1, 32).unwrap();
+        let policy = policy_of(1, 1);
+        let cipher = crate::crypto::SecretCipher::generate([1u8; 16], policy.bytes(), 32).unwrap();
         let path = dir.0.join("staged");
         let mut file = crate::store::create_private_file(&path).unwrap();
         let first = cipher.encrypt_chunk(0, false, b"prefix-secret").unwrap();
@@ -781,11 +1058,10 @@ mod tests {
         let staged = super::StagedSealed {
             path,
             header: crate::format::SealedHeader {
-                threshold: 1,
-                count: 1,
                 key_bytes: 32,
                 group: [1u8; 16],
                 nonce_prefix: *cipher.nonce_prefix(),
+                policy,
             },
             commitment: [0u8; 32],
         };

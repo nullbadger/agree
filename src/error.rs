@@ -4,6 +4,9 @@ pub(crate) enum Error {
     #[error("need at least {need} shares to restore this secret; received {got}")]
     NeedShares { need: u8, got: usize },
 
+    #[error("quorum {quorum} needs weight {need}; have {got}")]
+    NeedWeight { quorum: u8, need: u8, got: u8 },
+
     #[error("secret authentication failed")]
     AuthenticationFailed,
 

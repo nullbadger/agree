@@ -16,7 +16,7 @@ Safety: static review of this repository. No live attack, no fuzzing of a card, 
 
 ## 0. Executive summary
 
-`agree` 1.0.0 splits an arbitrary-length secret so a threshold of shares can restore it. The secret is encrypted under a data key. Only that key is split with Shamir. Shares may sit on files, `device:` nodes, or YubiKey PIV objects. Split reads stdin. Restore writes stdout.
+`agree` 1.0.0 splits an arbitrary-length secret so a quorum of shares can restore it. The secret is encrypted under a data key. One quorum splits that key with Shamir. Further quorums split pads that XOR to the key. A weight is that many Shamir points in one share file. Shares may sit on files, `device:` nodes, or YubiKey PIV objects. Split reads stdin. Restore writes stdout.
 
 This is not a multi-tenant service. The trust boundary is the dealer machine and the people who hold shares. The tool cannot make an untrusted dealer safe.
 
@@ -32,7 +32,7 @@ Top risks:
 | T-006 | Low | Authentication failure used to be able to emit a plaintext prefix. Fixed in this tree: stdout is written only after every chunk authenticates. |
 | T-007 | Medium | No independent cryptographic audit. |
 
-Decisions: Alexander Weber accepted T-001 through T-008 on 2026-11-10. Review by 2027-11-10. The ceremony checklist in `docs/CEREMONY.md` is the control for the risks the binary cannot close.
+Decisions: Alexander Weber accepted T-001 through T-008 on 2026-11-10. Review by 2027-11-10. The ceremony checklists in `docs/CEREMONY.md` (3 of 5) and `docs/CEREMONY-POLICY.md` (two quorums, weights not all 1) are the controls for the risks the binary cannot close. Do not mix the two pages.
 
 Residual headline: a careful 3-of-5 ceremony on a watched air-gapped machine is what the tool is for. It is not a substitute for an audited HSM, and it does not keep the quorum after restore.
 
@@ -42,16 +42,16 @@ Residual headline: a careful 3-of-5 ceremony on a watched air-gapped machine is 
 
 Break-glass storage of a secret, typically a signing key. Journeys:
 
-1. Dealer splits stdin into `n` shares, threshold `t`, optional external data key.
+1. Dealer splits stdin into `n` shares. The default policy is threshold `t`, every weight 1. Optional weights and further quorums are the same split. Optional external data key.
 2. Custodians store shares apart from each other.
-3. Any `t` shares restore the original bytes to stdout.
+3. A set that meets every quorum restores the original bytes to stdout. A set that misses one does not.
 4. `agree devices` lists hardware this build can open.
 
 There is no network service, no account, and no second use of the secret after restore.
 
 ### 1.2 In scope / out of scope
 
-In scope: the `agree` binary, format v2, file / `device:` / `yubikey:` destinations, `--key-file`, passwords, and the dealer machine while the process runs.
+In scope: the `agree` binary, format v1, file / `device:` / `yubikey:` destinations, `--key-file`, passwords, weights, quorums, and the dealer machine while the process runs.
 
 Out of scope: cloud control planes, tenant isolation, CSP physical security, Okta/FIDO2 logins, Git signing, and whatever the restored signing key is used for afterwards. N/A — this product does not run there.
 
@@ -60,9 +60,9 @@ Out of scope: cloud control planes, tenant isolation, CSP physical security, Okt
 | ID | Actor | Type | Trust | AuthN | Notes |
 | --- | --- | --- | --- | --- | --- |
 | A-1 | Dealer | human | high for the hour of the ceremony | physical presence | Sees the secret. Required by the design. |
-| A-2 | Custodian | human | holds one share | share possession, optional password, optional YubiKey PIN | Must not hold enough shares to meet `t` alone. |
-| A-3 | Hostile custodian | adversarial | one or fewer than `t` shares | same | Goal: open the secret without a quorum. |
-| A-4 | Thief of shares | adversarial | stolen files or tokens | none | Same goal as A-3 if they reach `t`. |
+| A-2 | Custodian | human | holds one share | share possession, optional password, optional YubiKey PIN | Must not hold a set that meets every quorum alone. |
+| A-3 | Hostile custodian | adversarial | a set that misses a quorum | same | Goal: open the secret without a quorum. |
+| A-4 | Thief of shares | adversarial | stolen files or tokens | none | Same goal as A-3 if they meet every quorum. |
 | A-5 | Operator of the dealer machine | adversarial or careless | the process | local user | Malware, swap, core dump, shell history. |
 | A-6 | Supply chain | adversarial | crate author or build | none | `shamirs`, `chacha20poly1305`, `yubikey`, `aes`. |
 
@@ -78,7 +78,7 @@ Anonymous internet, tenant admin, support impersonation, CI cloud admin, and IdP
 | Sealed ciphertext | L | H | H | file, device, or PIV object | anyone; useless without the key |
 | Share password | H | H | L | terminal or `--password-stdin` | that custodian |
 | PIV PIN and management key | H | H | M | terminal, or argv if `--management-key` | dealer |
-| Group id, threshold, key length | L | M | L | cleartext header | anyone with the file |
+| Group id, policy, key length | L | M | L | cleartext header | anyone with the file |
 
 Cross-tenant rule: N/A. One ceremony, one group id. A share from another group is rejected.
 
@@ -102,7 +102,7 @@ Cross-tenant rule: N/A. One ceremony, one group id. A share from another group i
 | In | `--share`, `--sealed` | existing shares and sealed bytes |
 | Out | stdout | restored secret only. Refused if it is a terminal. |
 | Out | stderr | status, warnings. `--debug` also prints PIN and management key. |
-| Out | share and sealed destinations | format v2 bytes |
+| Out | share and sealed destinations | format v1 bytes |
 | Out | temp files | staged ciphertext, and plaintext only until authentication finishes |
 
 No HTTPS, webhooks, queues, or admin API.
@@ -115,14 +115,14 @@ No HTTPS, webhooks, queues, or admin API.
 | TB2 Process ↔ filesystem | shares, sealed file, key file | `0600` create, no overwrite without `--force` | Fail closed on existence and permission errors. |
 | TB3 Process ↔ device node | raw bytes | `--force` required, refuse a terminal | Fail closed without `--force`. No rollback after a partial write. |
 | TB4 Process ↔ YubiKey | PIV object, PIN, management key | PIN to read, management key to write, object id allow-list | Fail closed on auth. A successful write cannot be unwritten. |
-| TB5 Fewer than `t` shares ↔ secret | nothing, if Shamir and AEAD hold | threshold check, then Poly1305 | Fail closed. Stdout untouched. |
+| TB5 A set that misses a quorum ↔ secret | nothing, if Shamir, the pad XOR, and AEAD hold | quorum check, then Poly1305 | Fail closed. Stdout untouched. |
 | TB6 This binary ↔ another `agree` | files | format revision byte | Fail closed. No old reader. |
 
 Internet ↔ edge, tenant ↔ tenant, IdP, CI ↔ prod, and CSP management plane: N/A. No such boundary exists.
 
 ### 1.8 Architecture overview
 
-One binary. `main` parses arguments and prompts. `engine` streams the secret, splits the key, and restores. `crypto` does layered XChaCha20-Poly1305 and Argon2id share wrap. `format` revision is 2. `store` publishes files by rename. `hardware` talks PC/SC. `devices` lists kinds. The default build links PC/SC. `--no-default-features` rejects `yubikey:` locations.
+One binary. `main` parses arguments and prompts. `engine` streams the secret, splits the key, and restores. `crypto` does layered XChaCha20-Poly1305 and Argon2id share wrap. `format` revision is 1. `store` publishes files by rename. `hardware` talks PC/SC. `devices` lists kinds. The default build links PC/SC. `--no-default-features` rejects `yubikey:` locations.
 
 ### 1.9 Data flow diagrams
 
@@ -146,12 +146,12 @@ flowchart LR
   K -->|exact key bytes, no exec| S
   S -->|0600 rename| F
   S -->|PIN plus management key| Y
-  F -->|t shares| S
+  F -->|a restoring set| S
   Y -->|PIN| S
   S -->|stdout, after every chunk authenticates| D
 ```
 
-L2 restore: read shares, reject a short set, unwrap passwords, stage the sealed file, check the commitment, recover the key, decrypt every chunk to a `0600` temp file, and only then copy to stdout.
+L2 restore: read shares, reject a set that misses a quorum, unwrap passwords, stage the sealed file, check the commitment, recover each pad, XOR the pads, decrypt every chunk to a `0600` temp file, and only then copy to stdout. One quorum recovers the data key directly. There is no second pad.
 
 ### 1.10 Interaction tuples
 
@@ -161,13 +161,13 @@ L2 restore: read shares, reject a short set, unwrap passwords, stage the sealed 
 | TU-2 | `--key-file` --bytes--> split | TB2 | data key |
 | TU-3 | split --Shamir share--> file or YubiKey | TB2, TB4 | share |
 | TU-4 | split --ciphertext--> sealed destination | TB2, TB3, TB4 | sealed file |
-| TU-5 | t shares --recover--> data key | TB5 | data key |
+| TU-5 | a restoring set --recover pads, XOR--> data key | TB5 | data key |
 | TU-6 | sealed file + key --decrypt--> stdout | TB5 | secret |
 | TU-7 | argv `--management-key` --> process list | TB1 | management key |
 
 ### 1.11 Tenancy and isolation model
 
-N/A as SaaS tenancy. Isolation is the Shamir threshold plus the group id and commitment. A share from another split does not open this sealed file. There is no row filter to get wrong.
+N/A as SaaS tenancy. Isolation is the policy (weights and quorums) plus the group id and commitment. A share from another split does not open this sealed file. There is no row filter to get wrong. A weight is points in the file, not a label checked after interpolation.
 
 ### 1.12 Identity and access model
 
@@ -178,7 +178,7 @@ No user accounts. Access to a share is possession. A password is a local wrap, n
 | Dependency | Data | Failure | Compromise impact | Owner |
 | --- | --- | --- | --- | --- |
 | OS CSPRNG via `getrandom` | data key, nonces, group id | split refuses if the RNG fails | predictable key | OS |
-| `shamirs` 0.7.0, pinned | data key bytes | wrong field arithmetic | fewer than `t` shares reconstruct the key | crate author, unaudited |
+| `shamirs` 0.7.0, pinned | data key or pad bytes | wrong field arithmetic | fewer points than that pad's threshold reconstruct the pad | crate author, unaudited |
 | `chacha20poly1305` | secret chunks, share wrap | auth failure | fail closed | RustCrypto |
 | `argon2` | share passwords | slow unwrap | local cost, not a remote DoS | crate |
 | `yubikey` 0.8.0 feature `untested` | PIV reads and writes | card error | fail closed; upstream marks those APIs untested | crate, plus `piv_aes` in this repo |
@@ -195,14 +195,14 @@ No user accounts. Access to a share is possession. A password is a local wrap, n
 - `--key-file` is not executed and is not a `device:` or `yubikey:` location.
 - Key length is a multiple of 32, from 32 to 1024, checked again on restore.
 - File outputs are created `0600` and published by rename.
-- Format revision 2 is the only revision this binary reads.
+- Format revision 1 is the only revision this binary reads.
 
 ### 1.15 Assumptions
 
 | # | Assumption | State |
 | --- | --- | --- |
 | A1 | The dealer machine is watched and wiped after the ceremony. | OWNER_CLAIM. The tool cannot check it. |
-| A2 | Custodians do not pool `t` shares outside a restore. | OWNER_CLAIM. |
+| A2 | Custodians do not pool a set that meets every quorum outside a restore. A weight-2 file is two points; after it is unwrapped those points can be peeled apart. That is the same class of failure as copying a share. | OWNER_CLAIM. |
 | A3 | `shamirs` 0.7.0 implements GF(256) Shamir correctly. | UNVERIFIED by an independent audit. Tests in this repo check the quorum matrix against that crate. |
 | A4 | XChaCha20-Poly1305 in `chacha20poly1305` 0.10.1 is correct. | UNVERIFIED by an audit of this product. The construction uses a distinct key per layer and a nonce of random prefix plus chunk counter. |
 | A5 | A pipe passed as `--key-file` is not retained by the generator. | OWNER_CLAIM. |
@@ -216,7 +216,7 @@ None in the repository. Impact of a failed ceremony is loss or disclosure of the
 
 | ID | Kind | Description | Coverage | Evidence |
 | --- | --- | --- | --- | --- |
-| C-1 | prevent | Threshold check before decrypt | every restore | engine tests, CLI quorum test |
+| C-1 | prevent | Quorum check before decrypt | every restore | engine tests, CLI quorum test |
 | C-2 | prevent | Poly1305 per chunk, layer number in AAD | every chunk | crypto unit test |
 | C-3 | prevent | SHA-256 commitment of sealed bytes in every share | every restore | engine tamper tests |
 | C-4 | prevent | Stdout refused when it is a terminal | restore | CLI |
@@ -232,7 +232,7 @@ None in the repository. Impact of a failed ceremony is loss or disclosure of the
 
 ### 2.1 Adversary set and objectives
 
-A-3 and A-4 want the secret with fewer than `t` shares. A-5 wants the secret from the dealer machine during or after the ceremony. A-6 wants a backdoor in a dependency. Nobody is attacking a remote API, because there is not one.
+A-3 and A-4 want the secret with a set that misses a quorum. A-5 wants the secret from the dealer machine during or after the ceremony. A-6 wants a backdoor in a dependency. Nobody is attacking a remote API, because there is not one.
 
 ### 2.2 Methodology notes
 
@@ -303,7 +303,7 @@ Accepted: 2026-11-10 by Alexander Weber
 
 ```
 ID: T-003
-Title: A flaw in shamirs 0.7.0 lets fewer than t shares determine the data key
+Title: A flaw in shamirs 0.7.0 lets fewer points than a quorum's threshold determine that pad
 STRIDE: [I]
 Packs: [K, S]
 Actor: A-3, A-6
@@ -311,14 +311,14 @@ Surface: TU-5
 Assets: data key, secret
 Preconditions: the crate's field arithmetic or randomness is wrong
 Attack path:
-  1. Custodians hold fewer than t shares.
-  2. The attacker reconstructs the key from those shares, or from biased dealer output.
+  1. Custodians hold a set that misses a quorum, so they hold fewer points than that pad's threshold.
+  2. The attacker reconstructs the pad from those points, or from biased dealer output, and therefore the data key.
   3. Poly1305 then opens the sealed file.
 Impact: { c: H, i: H, a: L, tenancy_breach: N, privacy: H }
 Impact narrative: The information-theoretic claim is only as strong as that crate.
 Blast radius: every secret split by this binary
 Likelihood: L
-Likelihood rationale: The crate is pinned. This repo tests 3-of-5 subsets and rejects pairs. That is not an audit.
+Likelihood rationale: The crate is pinned. This repo tests 3-of-5 subsets, weighted shares, and two quorums. That is not an audit.
 Risk: High
 Evidence: Cargo.toml pins shamirs =0.7.0. No third-party review in the repo.
 Existing controls: C-1, C-2
@@ -486,13 +486,13 @@ T-001: be the dealer, or own the dealer machine for the hour of the split. No cr
 
 T-002: keep the key file. Restore is unnecessary if the attacker also has the sealed file. They still need the sealed file. The shares are irrelevant.
 
-T-003: obtain fewer than `t` shares and exploit a flaw in `shamirs`. No such flaw is evidenced here. The path is the reason the pin and the missing audit matter.
+T-003: obtain a set that misses a quorum and exploit a flaw in `shamirs` so those points still determine the missing pad. No such flaw is evidenced here. The path is the reason the pin and the missing audit matter.
 
 ### 2.5 Abuse cases
 
 | ID | Actor goal | Flow abused | Success | Threats |
 | --- | --- | --- | --- | --- |
-| AB-001 | One person opens the secret | threshold 1, or two shares in one place under a 2-of-n policy | they hold `t` shares | T-001 |
+| AB-001 | One person opens the secret | threshold 1, a weight that alone meets every quorum, or two shares in one place under a 2-of-n policy | they hold a set that meets every quorum | T-001 |
 | AB-002 | Skip the quorum with a generator they can run again | `--key-file` whose source is a token that regenerates the key | sealed file opens with no shares | T-002 |
 | AB-003 | Publish a half ceremony as done | YubiKey write succeeds, later share fails, operator keeps the card | a live share of a discarded split | T-004 |
 
@@ -647,7 +647,7 @@ Accepted 2026-11-10 by Alexander Weber. Review by 2027-11-10.
 
 | ID | What is accepted | Required control |
 | --- | --- | --- |
-| T-001 | The dealer process sees the secret. | `docs/CEREMONY.md`. Air-gapped machine, witness, wipe. |
+| T-001 | The dealer process sees the secret. | `docs/CEREMONY.md` or `docs/CEREMONY-POLICY.md`, the page that matches the policy. Air-gapped machine, witness, wipe. |
 | T-002 | A retained external key bypasses Shamir. | Do not pass `--key-file` in the ceremony. |
 | T-003 | `shamirs` 0.7.0 is unaudited. It is the latest release and stays pinned. | Do not bump it without a review. |
 | T-004 | A YubiKey or device write cannot be undone. | Write YubiKey shares last. A failed command starts a new split. |
@@ -658,7 +658,7 @@ Accepted 2026-11-10 by Alexander Weber. Review by 2027-11-10.
 
 ### 3.5 Transferred risks
 
-None. The duties that were going to be transferred to the operator are accepted by the owner and written into `docs/CEREMONY.md`.
+None. The duties that were going to be transferred to the operator are accepted by the owner and written into `docs/CEREMONY.md` and `docs/CEREMONY-POLICY.md`.
 
 ### 3.6 Security requirements
 

@@ -5,9 +5,22 @@
 //! byte is read from the card, and a 3DES key stays on the crate path.
 
 use {
-    aes::cipher::{Block, BlockCipherDecrypt, BlockCipherEncrypt, Key, KeyInit},
-    anyhow::{bail, Context, Result},
-    rand_core::{OsRng, RngCore},
+    aes::cipher::{
+        Block,
+        BlockCipherDecrypt,
+        BlockCipherEncrypt,
+        Key,
+        KeyInit,
+    },
+    anyhow::{
+        bail,
+        Context,
+        Result,
+    },
+    rand_core::{
+        OsRng,
+        RngCore,
+    },
     std::ffi::CStr,
 };
 
@@ -150,9 +163,11 @@ fn verify_pin(card: &pcsc::Card, pin: &[u8]) -> Result<()> {
     match status_word(&response) {
         | 0x9000 => Ok(()),
         | 0x6983 => Err(super::pin_failure(yubikey::Error::WrongPin { tries: 0 })),
-        | word if word & 0xfff0 == 0x63c0 => Err(super::pin_failure(yubikey::Error::WrongPin {
-            tries: (word & 0x000f) as u8,
-        })),
+        | word if word & 0xfff0 == 0x63c0 => {
+            Err(super::pin_failure(yubikey::Error::WrongPin {
+                tries: (word & 0x000f) as u8,
+            }))
+        },
         | _ => bail!("YubiKey PIN verification failed"),
     }
 }
@@ -287,7 +302,11 @@ fn status_word(response: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{algorithm_byte, decrypt_block, encrypt_block};
+    use super::{
+        algorithm_byte,
+        decrypt_block,
+        encrypt_block,
+    };
 
     #[test]
     fn reads_the_algorithm_from_management_key_metadata() {
