@@ -111,7 +111,7 @@ No PIN is required for this command. Nothing is written.
 
 ## Split
 
-The dealer types this command and no other. Substitute the real serials from the roster, in custodian order. Share 1 is the first `--share`. Share 4 is the fourth. The serial is not the index. Keep file shares in the same index the roster gave them. Do not reorder the flags to match who arrived first.
+The dealer types this command and no other. Substitute the real serials from the roster, in custodian order. Share 1 is the first `--share`. Share 4 is the fourth. The serial is not the index. The number before the colon is the threshold, not the quorum number. Both lines start with `2` because both quorums need weight 2. The first `--quorum` is quorum 1. Keep file shares in the same index the roster gave them. Do not reorder the flags to match who arrived first.
 
 Do not add `--threshold`. Do not add `--weight`. Do not add `--key-file`. Do not add `--key-bytes`. Do not add `--management-key`. Do not add `--debug`. Do not add `--force` unless a stopped earlier attempt left an object and the witness has agreed that this is a new split overwriting that object.
 
@@ -123,7 +123,7 @@ agree split \
   --share yubikey:SERIAL3/5fff21 \
   --share yubikey:SERIAL4/5fff21 \
   --share yubikey:SERIAL5/5fff21 \
-  --quorum 1:1=2,2,3 \
+  --quorum 2:1=2,2,3 \
   --quorum 2:1=1,4=2,5 \
   --protect \
   < secret-file

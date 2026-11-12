@@ -95,7 +95,7 @@ CISO's file holds one point of each pad. CFO never completes a restore: quorum 2
 ```text
 --share ceo.share --share cfo.share --share coo.share
 --share ciso.share --share eng.share
---quorum 1:1=2,2,3
+--quorum 2:1=2,2,3
 --quorum 2:1=1,4=2,5
 ```
 
@@ -126,7 +126,9 @@ A lost CEO still leaves CFO, COO, and CISO. A lost CISO still leaves CEO and Eng
 
 ### YubiKey
 
-The location does not change the policy. One object per custodian. The sealed secret stays a file. A PIV object holds at most 3063 bytes, and a high weight on a long key can pass that. The default 32-byte key at the weights on this page fits.
+The location does not change the policy. One object per custodian. The sealed secret stays a file. A PIV object holds at most 3063 bytes. The quorum does not raise that limit. It spends it on points. Each point is `1 + key-bytes`. The policy itself is a few dozen bytes, copied into every share. A password wrap adds 60 bytes. The ceremony leaves a YubiKey share unprotected, so that 60 is not in the object. The PIN is the binding.
+
+A 3-of-5 share of a 32-byte key is 113 bytes. Custodian 1 on this page, three points, is 185 bytes. The same three points of a 1024-byte key are 3161 bytes, which is over the limit and refused. Two points of that key are 2134 bytes and still fit. The default key has room for dozens of points. A 1024-byte key has room for two.
 
 ```bash
 agree split \
@@ -136,7 +138,7 @@ agree split \
   --share yubikey:33333333/5fff21 \
   --share yubikey:44444444/5fff21 \
   --share yubikey:55555555/5fff21 \
-  --quorum 1:1=2,2,3 \
+  --quorum 2:1=2,2,3 \
   --quorum 2:1=1,4=2,5 \
   --protect \
   < secret-file
