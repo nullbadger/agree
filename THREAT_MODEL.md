@@ -28,7 +28,7 @@ Top risks:
 | T-002 | High | A retained copy of `--key-file` opens the sealed secret with no shares. |
 | T-003 | High | The Shamir claim depends on unaudited `shamirs` 0.7.0. |
 | T-004 | Medium | A YubiKey or `device:` write cannot be rolled back after a later failure. |
-| T-005 | Medium | `mlock` and core-dump disable are best-effort. Swap or a crash dump can keep key bytes. |
+| T-005 | Medium | Core-dump disable is best-effort. `mlock` failure now refuses to run. Swap of an unlocked data key is closed; a crash dump can still keep key bytes. |
 | T-006 | Low | Authentication failure used to be able to emit a plaintext prefix. Fixed in this tree: stdout is written only after every chunk authenticates. |
 | T-007 | Medium | No independent cryptographic audit. |
 
@@ -225,7 +225,7 @@ None in the repository. Impact of a failed ceremony is loss or disclosure of the
 | C-7 | prevent | Reserved PIV objects refused without `--force` | YubiKey writes | hardware tests, no card opened |
 | C-8 | prevent | Key file length checked before shares are written | split | CLI and crypto tests |
 | C-9 | prevent | Plaintext held off stdout until every chunk authenticates | restore | `authentication_failure_does_not_emit_a_prefix` |
-| C-10 | prevent | Core dumps disabled and key `mlock`ed when the OS allows | process | best-effort, warned on failure |
+| C-10 | prevent | Data key `mlock`ed or the command refuses. Core dumps disabled when the OS allows | process | `mlock` fail-closed. Core-dump failure warns and continues. |
 | C-11 | respond | File shares already published are removed if a later file share fails | split | CLI rollback test |
 
 ## 2. Threat analysis
@@ -363,32 +363,32 @@ Accepted: 2026-11-10 by Alexander Weber
 
 ```
 ID: T-005
-Title: Key bytes survive in swap or a core dump when mlock or setrlimit fails
+Title: Key bytes survive in a core dump when setrlimit fails, or in unlocked copies outside the data key
 STRIDE: [I]
 Packs: [K, H]
 Actor: A-5
 Surface: process memory
 Assets: data key, secret
-Preconditions: the OS refuses mlock or core-dump disable, and the machine is later imaged
+Preconditions: the OS refuses core-dump disable, or the secret sits in an unlocked buffer, and the machine is later imaged
 Attack path:
-  1. Split warns and continues.
-  2. The key is paged out, or a crash writes a dump.
-  3. A later reader of that image obtains the key.
+  1. Split warns that core dumps could not be disabled and, if the ceremony ignores that, continues. A refused `mlock` does not continue.
+  2. A crash writes a dump, or the secret is paged from a buffer that was never locked.
+  3. A later reader of that image obtains the bytes.
 Impact: { c: H, i: H, a: L, tenancy_breach: N, privacy: H }
-Impact narrative: Same outcome as T-001, by a different path.
+Impact narrative: Same outcome as T-001, by a different path. The data-key swap path from a failed `mlock` is closed.
 Blast radius: that ceremony
 Likelihood: L
-Likelihood rationale: The warning is printed. A watched air-gapped machine is the assumed control. A container that cannot mlock is a weaker ceremony.
+Likelihood rationale: `mlock` failure refuses the command before prompts and before the secret is read. Core-dump disable still warns and continues. The secret buffer itself is not locked.
 Risk: Medium
-Evidence: memory.rs treats both calls as best-effort
+Evidence: memory.rs refuses on `mlock` failure. CLI test `split_refuses_when_mlock_is_unavailable`.
 Existing controls: C-10
 Mitigations: M-005
-Detection: the stderr warning
+Detection: the core-dump warning; `mlock` is an error, not a warning
 Disposition: accept
 Owner: Alexander Weber
 Status: accepted
 Review_by: 2027-11-10
-Accepted: 2026-11-10 by Alexander Weber
+Accepted: 2026-11-10 by Alexander Weber. `mlock` refusal added 2026-11-11. Residual is the core dump and unlocked secret copies.
 ```
 
 ```
@@ -582,8 +582,8 @@ REQ: REQ-004
 ID: M-005
 Threats: T-005
 Type: prevent
-Description: mlock and disable core dumps. Warn and continue when the OS refuses, so a container can still run. The warning is the signal to abort a high-value ceremony.
-Verification: memory.rs
+Description: mlock the data key or refuse to run. Disable core dumps, and warn if that call fails. A container that cannot mlock cannot split or restore.
+Verification: memory.rs; tests/cli.rs split_refuses_when_mlock_is_unavailable
 Owner: engineering
 Effort: S
 Status: done
@@ -651,7 +651,7 @@ Accepted 2026-11-10 by Alexander Weber. Review by 2027-11-10.
 | T-002 | A retained external key bypasses Shamir. | Do not pass `--key-file` in the ceremony. |
 | T-003 | `shamirs` 0.7.0 is unaudited. It is the latest release and stays pinned. | Do not bump it without a review. |
 | T-004 | A YubiKey or device write cannot be undone. | Write YubiKey shares last. A failed command starts a new split. |
-| T-005 | `mlock` and core-dump disable can fail. | Abort the ceremony if that warning appears. |
+| T-005 | Core-dump disable can fail. `mlock` failure aborts. The secret buffer is not locked. | Abort if core dumps could not be disabled. A machine that cannot `mlock` cannot run the command. |
 | T-006 | After every chunk authenticates, a broken stdout pipe can still truncate the secret. The prefix-on-failure defect is fixed. | Check the process exit code before trusting the output file. |
 | T-007 | This release is not an audit. | Say so wherever the binary is published. |
 | T-008 | `--management-key` is visible to the process list. | Do not pass that flag. Use the terminal prompt. |
@@ -692,9 +692,9 @@ Verification: tests/cli.rs rollback test
 
 ```
 REQ-005
-MUST: mlock and core-dump disable failures warn and do not pretend they succeeded.
+MUST: mlock failure refuses split and restore before prompts and before the secret is read. Core-dump disable failure warns and does not pretend it succeeded.
 Derived_from: M-005, T-005
-Verification: main.rs warning path
+Verification: tests/cli.rs split_refuses_when_mlock_is_unavailable; main.rs core-dump warning
 ```
 
 ```
@@ -716,7 +716,7 @@ Verification: docs/README.md
 | Item | Revisit when |
 | --- | --- |
 | Feldman or other verifiable sharing | a custodian must prove a share without a test restore |
-| Refusing to run when mlock fails | a ceremony profile that cannot tolerate the warning |
+| Refusing to run when mlock fails | done 2026-11-11. Residual is the unlocked secret buffer and core dumps. |
 | Secure erase of temp plaintext beyond unlink | a platform offers a real wipe. Unlink is not one. |
 | Live YubiKey integration test in CI | a runner has a card. Do not pretend pcscd without a card is that test. |
 
@@ -806,3 +806,4 @@ No blocker. Owner acceptance is recorded in §3.4.
 | --- | --- | --- | --- |
 | 2026-11-10 | 71dcdb3 working tree | Initial model. T-006 mitigated by holding plaintext off stdout until every chunk authenticates. | code review |
 | 2026-11-10 | working tree | T-001 through T-008 accepted by Alexander Weber. Ceremony checklist is the control. Dependencies moved to latest stable. | Alexander Weber |
+| 2026-11-11 | working tree | T-005: `mlock` failure now refuses split and restore. Core-dump disable remains best-effort. | code review |

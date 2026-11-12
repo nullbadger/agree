@@ -10,11 +10,7 @@
 #[cfg(not(feature = "yubikey"))]
 use crate::error::Error;
 #[cfg(feature = "yubikey")]
-use crate::location::{
-    decode_hex,
-    ensure_object_allowed,
-    YUBIKEY_OBJECT_MAX,
-};
+use crate::location::{decode_hex, ensure_object_allowed, YUBIKEY_OBJECT_MAX};
 #[cfg(not(feature = "yubikey"))]
 use anyhow::Context;
 use anyhow::Result;
@@ -26,20 +22,10 @@ mod piv_aes;
 #[cfg(feature = "yubikey")]
 mod session {
     use {
-        super::{
-            ensure_object_allowed,
-            YUBIKEY_OBJECT_MAX,
-        },
+        super::{ensure_object_allowed, YUBIKEY_OBJECT_MAX},
         crate::error::Error,
-        anyhow::{
-            Context,
-            Result,
-        },
-        yubikey::{
-            MgmKey,
-            Serial,
-            YubiKey,
-        },
+        anyhow::{Context, Result},
+        yubikey::{MgmKey, Serial, YubiKey},
         zeroize::Zeroize,
     };
 
@@ -126,10 +112,8 @@ mod session {
 
         fn connect(&self) -> Result<YubiKey> {
             let mut key = match self.serial {
-                | Some(serial) => {
-                    YubiKey::open_by_serial(Serial(serial))
-                        .with_context(|| format!("Failed to open YubiKey {serial}"))?
-                },
+                | Some(serial) => YubiKey::open_by_serial(Serial(serial))
+                    .with_context(|| format!("Failed to open YubiKey {serial}"))?,
                 | None => YubiKey::open().context("Failed to open YubiKey")?,
             };
             key.verify_pin(&self.pin).map_err(super::pin_failure)?;
@@ -169,10 +153,7 @@ mod session {
 
 #[cfg(not(feature = "yubikey"))]
 mod session {
-    use {
-        super::Error,
-        anyhow::Result,
-    };
+    use {super::Error, anyhow::Result};
 
     #[derive(Debug)]
     pub(crate) struct YubiKeyStore;

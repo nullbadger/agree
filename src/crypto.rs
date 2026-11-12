@@ -7,42 +7,17 @@
 //! chunk index, so a rearranged or swapped sealed file fails authentication.
 
 use {
-    crate::{
-        error::Error,
-        memory::DataKey,
-        secret::Password,
-    },
-    anyhow::{
-        bail,
-        Context,
-        Result,
-    },
-    argon2::{
-        Algorithm,
-        Argon2,
-        Params,
-        Version,
-    },
+    crate::{error::Error, memory::DataKey, secret::Password},
+    anyhow::{bail, Context, Result},
+    argon2::{Algorithm, Argon2, Params, Version},
     chacha20poly1305::{
-        aead::{
-            Aead,
-            KeyInit,
-            Payload,
-        },
-        ChaCha20Poly1305,
-        XChaCha20Poly1305,
-        XNonce,
+        aead::{Aead, KeyInit, Payload},
+        ChaCha20Poly1305, XChaCha20Poly1305, XNonce,
     },
-    rand_core::{
-        OsRng,
-        RngCore,
-    },
+    rand_core::{OsRng, RngCore},
     std::{
         fs::File,
-        io::{
-            self,
-            Read,
-        },
+        io::{self, Read},
         path::Path,
     },
     zeroize::Zeroize,
@@ -71,8 +46,8 @@ pub(crate) struct SecretCipher {
 }
 
 impl SecretCipher {
-    pub(crate) fn generate(group: [u8; 16], threshold: u8, count: u8, key_bytes: usize) -> Self {
-        Self::from_key(DataKey::generate(key_bytes), group, threshold, count)
+    pub(crate) fn generate(group: [u8; 16], threshold: u8, count: u8, key_bytes: usize) -> Result<Self> {
+        Ok(Self::from_key(DataKey::generate(key_bytes)?, group, threshold, count))
     }
 
     pub(crate) fn from_key(key: DataKey, group: [u8; 16], threshold: u8, count: u8) -> Self {
@@ -122,10 +97,13 @@ impl SecretCipher {
             let nonce = XNonce::from(self.nonce(counter));
             let aad = self.aad(counter, last, u8::try_from(layer).expect("layer fits in u8"));
             current = cipher
-                .encrypt(&nonce, Payload {
-                    msg: &current,
-                    aad: &aad,
-                })
+                .encrypt(
+                    &nonce,
+                    Payload {
+                        msg: &current,
+                        aad: &aad,
+                    },
+                )
                 .map_err(|_| Error::EncryptionFailed)?;
         }
         Ok(current)
@@ -139,10 +117,13 @@ impl SecretCipher {
             let nonce = XNonce::from(self.nonce(counter));
             let aad = self.aad(counter, last, u8::try_from(layer).expect("layer fits in u8"));
             current = cipher
-                .decrypt(&nonce, Payload {
-                    msg: &current,
-                    aad: &aad,
-                })
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: &current,
+                        aad: &aad,
+                    },
+                )
                 .map_err(|_| Error::AuthenticationFailed)?;
         }
         Ok(current)
@@ -212,7 +193,7 @@ pub(crate) fn read_key_file(path: &Path, len: usize) -> Result<DataKey> {
         bail!("key file {} must contain exactly {len} bytes, got more", path.display());
     }
     buf.truncate(len);
-    Ok(DataKey::from_bytes(buf))
+    Ok(DataKey::from_bytes(buf)?)
 }
 
 /// Argon2id + ChaCha20-Poly1305 seal for one Shamir share.
@@ -277,18 +258,8 @@ impl ShareCipher {
 #[cfg(test)]
 mod tests {
     use {
-        super::{
-            read_key_file,
-            SecretCipher,
-            KEY_LEN,
-        },
-        std::{
-            fs,
-            io::Write,
-            path::PathBuf,
-            process::Command,
-            thread,
-        },
+        super::{read_key_file, SecretCipher, KEY_LEN},
+        std::{fs, io::Write, path::PathBuf, process::Command, thread},
     };
 
     struct Temp(PathBuf);
@@ -319,8 +290,8 @@ mod tests {
 
     #[test]
     fn chunk_roundtrip_binds_the_last_flag() {
-        let cipher = SecretCipher::generate([7u8; 16], 3, 5, KEY_LEN);
-        let wide = SecretCipher::generate([7u8; 16], 3, 5, KEY_LEN * 2);
+        let cipher = SecretCipher::generate([7u8; 16], 3, 5, KEY_LEN).unwrap();
+        let wide = SecretCipher::generate([7u8; 16], 3, 5, KEY_LEN * 2).unwrap();
         let ct = wide.encrypt_chunk(1, false, b"layer").unwrap();
         assert_eq!(wide.decrypt_chunk(1, false, &ct).unwrap(), b"layer");
         assert!(wide.decrypt_chunk(1, true, &ct).is_err());

@@ -1,12 +1,13 @@
 #![allow(unsafe_code)]
 
-//! Best-effort process hardening for secret bytes.
+//! Process hardening for secret bytes.
 //!
-//! `mlock` keeps a key off swap. Disabling core dumps keeps it out of a crash
-//! report. Both can fail for an unprivileged process; callers warn and continue
-//! so a container can still run the ceremony.
+//! `mlock` keeps a key off swap. It is required: if the operating system
+//! refuses, split and restore stop. Disabling core dumps keeps the key out of
+//! a crash report. That call can fail for an unprivileged process; callers
+//! warn and continue.
 
-use zeroize::Zeroize;
+use {crate::error::Error, zeroize::Zeroize};
 
 /// Disable core dumps for this process. Failure is reported by the caller.
 #[cfg(unix)]
@@ -32,16 +33,26 @@ pub(crate) fn disable_core_dumps() -> bool {
 pub(crate) struct DataKey(Vec<u8>);
 
 impl DataKey {
-    pub(crate) fn generate(len: usize) -> Self {
+    pub(crate) fn generate(len: usize) -> Result<Self, Error> {
         let mut bytes = vec![0u8; len];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes);
-        lock(&mut bytes);
-        Self(bytes)
+        match lock(&mut bytes) {
+            | Ok(()) => Ok(Self(bytes)),
+            | Err(err) => {
+                bytes.zeroize();
+                Err(err)
+            },
+        }
     }
 
-    pub(crate) fn from_bytes(mut bytes: Vec<u8>) -> Self {
-        lock(&mut bytes);
-        Self(bytes)
+    pub(crate) fn from_bytes(mut bytes: Vec<u8>) -> Result<Self, Error> {
+        match lock(&mut bytes) {
+            | Ok(()) => Ok(Self(bytes)),
+            | Err(err) => {
+                bytes.zeroize();
+                Err(err)
+            },
+        }
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
@@ -62,13 +73,55 @@ impl std::fmt::Debug for DataKey {
     }
 }
 
-fn lock(bytes: &mut [u8]) {
+/// Lock and immediately drop a key of `len` bytes.
+///
+/// Split and restore call this before prompts and before reading the secret,
+/// so a machine that cannot pin the key never touches a token or the secret.
+pub(crate) fn require_mlock(len: usize) -> Result<(), Error> {
+    let _probe = DataKey::generate(len)?;
+    Ok(())
+}
+
+fn lock(bytes: &mut [u8]) -> Result<(), Error> {
+    if bytes.is_empty() {
+        return Err(Error::MlockFailed {
+            reason: "empty buffer".into(),
+        });
+    }
+    lock_pages(bytes)
+}
+
+#[cfg(unix)]
+fn lock_pages(bytes: &mut [u8]) -> Result<(), Error> {
+    // SAFETY: `bytes` is a live non-empty mutable slice. `mlock` pins those
+    // pages until `munlock`. It does not take ownership of the pointer.
+    let rc = unsafe { libc::mlock(bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(Error::MlockFailed {
+        reason: std::io::Error::last_os_error().to_string(),
+    })
+}
+
+#[cfg(not(unix))]
+fn lock_pages(bytes: &mut [u8]) -> Result<(), Error> {
+    let _ = bytes;
+    Err(Error::MlockFailed {
+        reason: "not supported on this platform".into(),
+    })
+}
+
+fn unlock(bytes: &mut [u8]) {
     #[cfg(unix)]
     {
-        // SAFETY: `bytes` is a live mutable slice. `mlock` pins those pages
-        // until `munlock`. It does not take ownership of the pointer.
+        if bytes.is_empty() {
+            return;
+        }
+        // SAFETY: same allocation passed to `mlock` for this key. Drop cannot
+        // report a failure; process exit releases any lock this call misses.
         unsafe {
-            let _ = libc::mlock(bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
+            let _ = libc::munlock(bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
         }
     }
     #[cfg(not(unix))]
@@ -77,16 +130,14 @@ fn lock(bytes: &mut [u8]) {
     }
 }
 
-fn unlock(bytes: &mut [u8]) {
-    #[cfg(unix)]
-    {
-        // SAFETY: same allocation passed to `mlock` for this key.
-        unsafe {
-            let _ = libc::munlock(bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = bytes;
+#[cfg(test)]
+mod tests {
+    use super::DataKey;
+
+    #[test]
+    fn refuses_to_lock_an_empty_buffer() {
+        let err = DataKey::generate(0).unwrap_err().to_string();
+        assert!(err.contains("mlock failed"), "{err}");
+        assert!(err.contains("refusing to continue"), "{err}");
     }
 }

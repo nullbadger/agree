@@ -1,11 +1,7 @@
 use {
     crate::location::Locator,
     anyhow::Result,
-    clap::{
-        Args,
-        Parser,
-        Subcommand,
-    },
+    clap::{Args, Parser, Subcommand},
     std::path::PathBuf,
 };
 

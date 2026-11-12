@@ -40,7 +40,7 @@ secret  --encrypt-->  sealed secret       (arbitrary length, not a share)
 6. If a share has a password, wrap that Shamir share with Argon2id and ChaCha20-Poly1305. The wrap is bound to the group, the index, the threshold, and the commitment. A wrapped body moved onto another share does not decrypt.
 7. Write the sealed secret, then the shares. File outputs are created mode `0600` and published by rename. If a later file share fails, file shares already published in that command are removed. A YubiKey or device write that already succeeded cannot be rolled back; the error names what was written.
 
-The data key is locked with `mlock` while it exists and cleared on drop. Core dumps for the process are disabled when the operating system allows it. Both are best-effort: a container may refuse `mlock` or `setrlimit`, and the tool warns rather than refusing to run. Do not treat that warning as decorative on a dealer machine.
+The data key is locked with `mlock` while it exists and cleared on drop. `split` and `restore` refuse to run if that lock fails. The refusal happens before any prompt and before the secret is read. Core dumps are disabled when the operating system allows it. If that call fails, the tool warns and continues. Do not treat that warning as decorative on a dealer machine.
 
 ## External data key
 
@@ -245,6 +245,7 @@ The tool is fail-closed on the secret. These cases do not write a restored secre
 | Truncated sealed secret, a format version this binary does not write, unknown share flags | Rejected. There is no old-version reader. |
 | Threshold larger than the number of `--share` arguments, or threshold 0 | Rejected. |
 | `--key-bytes` not a multiple of 32, or outside 32 to 1024 | Rejected before the key file is opened and before any share is written. |
+| `mlock` fails | `split` and `restore` exit before prompts and before the secret is read. No share is written. |
 | `--key-file` shorter or longer than `--key-bytes` | Rejected before prompts and before any share is written. |
 | `--key-file` is `device:`, `yubikey:`, a share path, or the sealed path | Rejected. The path is not executed. |
 | Existing file without `--force` | Left untouched. |

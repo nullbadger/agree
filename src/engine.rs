@@ -7,47 +7,19 @@
 
 use {
     crate::{
-        crypto::{
-            validate_key_bytes,
-            SecretCipher,
-            ShareCipher,
-            CHUNK_LEN,
-        },
+        crypto::{validate_key_bytes, SecretCipher, ShareCipher, CHUNK_LEN},
         error::Error,
-        format::{
-            commitment_eq,
-            SealedHeader,
-            SealedReader,
-            SealedWriter,
-            ShareRecord,
-        },
+        format::{commitment_eq, SealedHeader, SealedReader, SealedWriter, ShareRecord},
         memory::DataKey,
         secret::Password,
         store::create_private_file,
     },
-    anyhow::{
-        bail,
-        Context,
-        Result,
-    },
-    rand_core::{
-        OsRng,
-        RngCore,
-    },
-    shamirs::{
-        Share as ShamirShare,
-        Sharks,
-    },
+    anyhow::{bail, Context, Result},
+    rand_core::{OsRng, RngCore},
+    shamirs::{Share as ShamirShare, Sharks},
     std::{
-        fs::{
-            self,
-            File,
-        },
-        io::{
-            self,
-            Read,
-            Write,
-        },
+        fs::{self, File},
+        io::{self, Read, Write},
         path::PathBuf,
     },
     zeroize::Zeroize,
@@ -87,7 +59,7 @@ impl Engine {
         OsRng.fill_bytes(&mut group);
         let cipher = match key {
             | Some(key) => SecretCipher::from_key(key, group, threshold, count),
-            | None => SecretCipher::generate(group, threshold, count, key_len),
+            | None => SecretCipher::generate(group, threshold, count, key_len)?,
         };
         let header = SealedHeader {
             threshold,
@@ -304,7 +276,7 @@ fn recover(shares: &[Vec<u8>], threshold: u8, key_len: usize) -> Result<DataKey>
     if recovered.len() != key_len {
         return Err(Error::AuthenticationFailed.into());
     }
-    Ok(DataKey::from_bytes(recovered.to_vec()))
+    Ok(DataKey::from_bytes(recovered.to_vec())?)
 }
 
 fn decode_shares(encoded: &[Vec<u8>]) -> Result<Vec<ShareRecord>> {
@@ -424,16 +396,8 @@ fn temp_name() -> String {
 mod tests {
     use {
         super::Engine,
-        crate::{
-            format::ShareRecord,
-            memory::DataKey,
-            secret::Password,
-        },
-        std::{
-            fs,
-            io::Cursor,
-            path::PathBuf,
-        },
+        crate::{format::ShareRecord, memory::DataKey, secret::Password},
+        std::{fs, io::Cursor, path::PathBuf},
     };
 
     struct TempDir(PathBuf);
@@ -646,11 +610,12 @@ mod tests {
         );
 
         let err = engine
-            .restore(Cursor::new(sealed.clone()), &mut restored, &split.shares[0..3], &[
-                passwords[0].clone(),
-                None,
-                passwords[2].clone(),
-            ])
+            .restore(
+                Cursor::new(sealed.clone()),
+                &mut restored,
+                &split.shares[0..3],
+                &[passwords[0].clone(), None, passwords[2].clone()],
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("password protected"), "{err}");
@@ -770,7 +735,7 @@ mod tests {
                 2,
                 64,
                 &[None, None],
-                Some(DataKey::from_bytes(raw.clone())),
+                Some(DataKey::from_bytes(raw.clone()).unwrap()),
             )
             .unwrap();
         let bodies = split
@@ -794,7 +759,7 @@ mod tests {
                 1,
                 64,
                 &[None],
-                Some(DataKey::from_bytes(vec![1; 32])),
+                Some(DataKey::from_bytes(vec![1; 32]).unwrap()),
             )
             .err()
             .expect("a short provided key must fail")
@@ -806,7 +771,7 @@ mod tests {
     #[test]
     fn authentication_failure_does_not_emit_a_prefix() {
         let dir = TempDir::new();
-        let cipher = crate::crypto::SecretCipher::generate([1u8; 16], 1, 1, 32);
+        let cipher = crate::crypto::SecretCipher::generate([1u8; 16], 1, 1, 32).unwrap();
         let path = dir.0.join("staged");
         let mut file = crate::store::create_private_file(&path).unwrap();
         let first = cipher.encrypt_chunk(0, false, b"prefix-secret").unwrap();

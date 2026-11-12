@@ -56,7 +56,7 @@ The witness confirms, on the day, that every YubiKey row has a serial and that n
 2. The witness and the dealer are both present before the secret is brought in.
 3. The `agree` binary is the one whose hash is on the roster. The witness reads the hash from the paper. The dealer computes it and shows the screen. If they differ, stop.
 4. Run `agree` with no arguments, or `agree split --help`, only to confirm it starts. Do not pass `--debug`.
-5. If the process prints `could not disable core dumps`, stop. If it later prints that `mlock` failed, stop. Do not continue a high-value ceremony on a machine that prints either warning.
+5. If the process prints `could not disable core dumps`, stop. `split` and `restore` exit with `mlock failed` if the data key cannot be locked. That happens before any prompt and before the secret is read. If you see that error, stop. Do not continue on this machine.
 6. Custodians enter one at a time only when their step says so. They do not watch another custodian's PIN or password.
 
 ## Confirm the secret
@@ -180,7 +180,7 @@ A successor does not receive a forwarded share. Succession is a new split after 
 
 ## Open, later
 
-Three custodians, the witness, and a dealer. Not the same machine as the everyday laptop if that can be avoided. The same abort rules apply. If `mlock` or core dumps fail, stop and move to a machine where they do not.
+Three custodians, the witness, and a dealer. Not the same machine as the everyday laptop if that can be avoided. The same abort rules apply. If core dumps could not be disabled, or the command exits with `mlock failed`, stop and move to a machine where they do not.
 
 ```bash
 agree restore \
@@ -203,7 +203,7 @@ Stop, do not improvise, if any of these happen:
 
 - A named person is absent.
 - The binary hash does not match the roster.
-- Core dumps could not be disabled, or `mlock` failed.
+- Core dumps could not be disabled, or the command exits with `mlock failed`.
 - Two YubiKeys are plugged in and the serials were not already written on the roster.
 - Anyone proposes `--key-file`, `--management-key`, `--debug`, or `--force` without a burned object from a stopped attempt.
 - The management-key prompt is answered empty.

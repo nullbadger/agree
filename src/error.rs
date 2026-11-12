@@ -49,4 +49,7 @@ pub(crate) enum Error {
 
     #[error("refusing to write secret bytes to a terminal")]
     TerminalOutput,
+
+    #[error("mlock failed ({reason}); refusing to continue")]
+    MlockFailed { reason: String },
 }

@@ -4,20 +4,10 @@
 
 use std::{
     fs,
-    io::{
-        Read,
-        Write,
-    },
+    io::{Read, Write},
     os::unix::fs::PermissionsExt,
-    path::{
-        Path,
-        PathBuf,
-    },
-    process::{
-        Command,
-        Output,
-        Stdio,
-    },
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
 };
 
 fn agree() -> Command {
@@ -725,6 +715,19 @@ fn assert_nothing_written(dir: &Temp) {
 
 fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn split_refuses_when_mlock_is_unavailable() {
+    let dir = Temp::new();
+    let output = run_bash(
+        &dir.0,
+        "ulimit -l 0 && \"$AGREE\" split --threshold 1 --sealed sealed.bin --share a.share",
+        b"secret",
+    );
+    assert_err(&output, "mlock failed");
+    assert!(stderr(&output).contains("refusing to continue"), "{}", stderr(&output));
+    assert_nothing_written(&dir);
 }
 
 #[test]

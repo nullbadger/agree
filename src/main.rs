@@ -16,64 +16,25 @@ mod store;
 
 use {
     crate::{
-        args::{
-            AutocompleteArgs,
-            Command,
-            ManArgs,
-            RestoreArgs,
-            SplitArgs,
-        },
+        args::{AutocompleteArgs, Command, ManArgs, RestoreArgs, SplitArgs},
         crypto::read_key_file,
         engine::Engine,
         error::Error,
-        format::{
-            read_share_bytes,
-            ShareRecord,
-        },
+        format::{read_share_bytes, ShareRecord},
         hardware::YubiKeyStore,
-        location::{
-            Location,
-            Locator,
-            YUBIKEY_OBJECT_MAX,
-        },
-        memory::disable_core_dumps,
-        prompt::{
-            refuse_terminal_stdout,
-            Console,
-        },
+        location::{Location, Locator, YUBIKEY_OBJECT_MAX},
+        memory::{disable_core_dumps, require_mlock},
+        prompt::{refuse_terminal_stdout, Console},
         secret::Password,
-        store::{
-            create_private_file,
-            DevicePublisher,
-            FilePublisher,
-            Overwrite,
-        },
+        store::{create_private_file, DevicePublisher, FilePublisher, Overwrite},
     },
-    anyhow::{
-        bail,
-        Context,
-        Result,
-    },
-    rand_core::{
-        OsRng,
-        RngCore,
-    },
+    anyhow::{bail, Context, Result},
+    rand_core::{OsRng, RngCore},
     std::{
         collections::HashMap,
-        fs::{
-            self,
-            File,
-            OpenOptions,
-        },
-        io::{
-            self,
-            IsTerminal,
-            Read,
-        },
-        path::{
-            Path,
-            PathBuf,
-        },
+        fs::{self, File, OpenOptions},
+        io::{self, IsTerminal, Read},
+        path::{Path, PathBuf},
     },
     zeroize::Zeroize,
 };
@@ -133,7 +94,10 @@ fn devices() -> Result<()> {
 }
 
 fn split(locator: &Locator, console: &Console, args: SplitArgs) -> Result<()> {
-    crate::crypto::validate_key_bytes(args.key_bytes)?;
+    let key_len = crate::crypto::validate_key_bytes(args.key_bytes)?;
+    // Before prompts, the key file, and stdin. A refused lock must not consume
+    // the secret or ask for a PIN.
+    require_mlock(key_len)?;
     if args.threshold == 1 {
         eprintln!("warning: threshold 1 means any single share restores the secret");
     }
@@ -244,6 +208,9 @@ fn external_key_path(
 
 fn restore(locator: &Locator, console: &Console, args: RestoreArgs) -> Result<()> {
     refuse_terminal_stdout()?;
+    // Before share reads and PIN prompts. The largest key is the size that
+    // must fit; a later, smaller key uses the same check again.
+    require_mlock(crate::crypto::MAX_KEY_LEN)?;
     if let Some(value) = args.management_key.as_deref() {
         // Reading a share needs the PIN, not the management key. Reject a malformed
         // flag before prompting.
@@ -335,7 +302,7 @@ fn share_labels(shares: &[Location]) -> Vec<String> {
     shares.iter().map(ToString::to_string).collect()
 }
 
-fn ensure_destinations<'a>(locations: impl Iterator<Item=&'a Location>, overwrite: Overwrite) -> Result<()> {
+fn ensure_destinations<'a>(locations: impl Iterator<Item = &'a Location>, overwrite: Overwrite) -> Result<()> {
     for location in locations {
         match location {
             | Location::File(path) => FilePublisher::ensure_available(path, overwrite)?,

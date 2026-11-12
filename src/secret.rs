@@ -1,10 +1,7 @@
 use {
     crate::error::Error,
     std::fmt,
-    zeroize::{
-        Zeroize,
-        ZeroizeOnDrop,
-    },
+    zeroize::{Zeroize, ZeroizeOnDrop},
 };
 
 /// Maximum accepted share password, including a stdin line after newline
@@ -43,10 +40,7 @@ impl fmt::Debug for Password {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Password,
-        MAX_PASSWORD_BYTES,
-    };
+    use super::{Password, MAX_PASSWORD_BYTES};
 
     #[test]
     fn rejects_empty_and_overlong_passwords() {

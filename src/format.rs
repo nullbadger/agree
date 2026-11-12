@@ -15,19 +15,9 @@
 
 use {
     crate::error::Error,
-    anyhow::{
-        bail,
-        Context,
-        Result,
-    },
-    sha2::{
-        Digest,
-        Sha256,
-    },
-    std::io::{
-        Read,
-        Write,
-    },
+    anyhow::{bail, Context, Result},
+    sha2::{Digest, Sha256},
+    std::io::{Read, Write},
 };
 
 pub(crate) const FORMAT_VERSION: u8 = 2;
@@ -286,11 +276,7 @@ pub(crate) fn commitment_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SealedHeader,
-        ShareRecord,
-        FORMAT_VERSION,
-    };
+    use super::{SealedHeader, ShareRecord, FORMAT_VERSION};
 
     #[test]
     fn share_roundtrip_rejects_trailing_bytes() {
